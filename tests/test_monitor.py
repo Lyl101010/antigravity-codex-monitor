@@ -453,7 +453,7 @@ class MonitorTests(unittest.TestCase):
 
     def test_static_and_shell_syntax(self):
         manifest = json.loads((ROOT/'plugin/plugin.json').read_text(encoding='utf-8'))
-        self.assertEqual(manifest['version'],'1.0.0')
+        self.assertEqual(manifest['version'],'1.0.1')
         ps = (ROOT/'plugin/scripts/run-codex.ps1').read_text(encoding='utf-8')
         sh = (ROOT/'plugin/scripts/run-codex.sh').read_text(encoding='utf-8')
         self.assertNotRegex(ps, r'File\]::Replace\([^\n]*,\s*\$null\s*\)')
