@@ -2,3 +2,4 @@
 *.sh text eol=lf
 *.ps1 text eol=crlf
 *.png binary
+plugin/ui/app.html linguist-generated=true
