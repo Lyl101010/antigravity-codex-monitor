@@ -602,7 +602,15 @@ const html = `<!DOCTYPE html>
     <div class="side-brand">
       <div class="brand-medallions" aria-hidden="true">
         <span class="medal medal-ag">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="15" fill="#F4F1EA"/><path d="M21 43 43 21" fill="none" stroke="#3D6470" stroke-width="5" stroke-linecap="round"/><circle cx="20" cy="44" r="9" fill="#3D6470"/><circle cx="44" cy="20" r="9" fill="#C96442"/><circle cx="20" cy="44" r="3" fill="#F4F1EA"/><circle cx="44" cy="20" r="3" fill="#F4F1EA"/></svg>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <g clip-path="url(#gemStarClip)">
+              <rect width="24" height="24" fill="#4285F4"/>
+              <circle cx="4" cy="4" r="14" fill="url(#gemRed)"/>
+              <circle cx="4" cy="20" r="14" fill="url(#gemYellow)"/>
+              <circle cx="20" cy="20" r="13.5" fill="url(#gemGreen)"/>
+              <circle cx="20" cy="4" r="14" fill="url(#gemBlue)"/>
+            </g>
+          </svg>
         </span>
         <span class="medal medal-gpt">
           <svg viewBox="0 0 24 24" fill="currentColor">
