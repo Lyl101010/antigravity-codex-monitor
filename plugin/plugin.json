@@ -1,6 +1,6 @@
 {
   "name": "antigravity-codex-monitor",
-  "displayName": "Antigravity Codex Monitor",
+  "displayName": "antigravity-codex-monitor",
   "version": "1.0.0",
   "description": "Real-time Mission Control side-pane UI for monitoring Codex CLI (codex exec) tasks, live commands, syntax-colored diffs, and token telemetry inside Antigravity.",
   "logo": "assets/logo.svg",

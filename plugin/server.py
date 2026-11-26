@@ -31,8 +31,8 @@ PANE_META = {
     "ui": {"resourceUri": APP_URI},
     "com.google.antigravity/ui": {
         "entrypoints": [
-            {"type": "aux_pane", "title": "Codex Monitor"},
-            {"type": "global", "title": "Codex Monitor"},
+            {"type": "aux_pane", "title": "antigravity-codex-monitor"},
+            {"type": "global", "title": "antigravity-codex-monitor"},
         ]
     },
 }
@@ -64,7 +64,7 @@ def _compact_state(limit: int = 15, max_bytes: int = 750_000) -> dict:
 
 @mcp.tool(
     name="open_codex_monitor",
-    title="Codex Monitor",
+    title="antigravity-codex-monitor",
     description="Open or refresh the live Codex Mission Control panel in Antigravity's side pane to watch Codex CLI (codex exec) tasks in real time.",
     meta=PANE_META,
 )
