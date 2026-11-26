@@ -6,12 +6,12 @@ import re
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
 
 
-CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME") or pathlib.Path.home() / ".codex").expanduser()
+CODEX_HOME = pathlib.Path(os.path.abspath(os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex")))
 STATE_DB = max(CODEX_HOME.glob("state_*.sqlite"), key=lambda p: p.stat().st_mtime, default=CODEX_HOME / "state_missing.sqlite")
 SESSIONS_DIR = CODEX_HOME / "sessions"
 DISPATCH_LOG = CODEX_HOME / "codex-worker-dispatches.json"
@@ -92,18 +92,20 @@ def collect_exec_threads(limit=30):
 
     if STATE_DB.is_file():
         try:
-            con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True)
-            rows = con.execute(
-                """
-                SELECT id, rollout_path, cwd, created_at, updated_at, model, reasoning_effort, tokens_used
-                FROM threads
-                WHERE source = 'exec'
-                ORDER BY updated_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-            con.close()
+            uri = STATE_DB.as_uri()
+            if uri.startswith("file://") and not uri.startswith("file:///"):
+                uri = "file:////" + uri.removeprefix("file://")
+            with closing(sqlite3.connect(f"{uri}?mode=ro", uri=True)) as con:
+                rows = con.execute(
+                    """
+                    SELECT id, rollout_path, cwd, created_at, updated_at, model, reasoning_effort, tokens_used
+                    FROM threads
+                    WHERE source = 'exec'
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
             for r in rows:
                 rp = clean_path(r[1])
                 mtime = pathlib.Path(rp).stat().st_mtime if rp and pathlib.Path(rp).is_file() else (r[4] or 0)
@@ -340,10 +342,17 @@ def parse_rollout(path_str):
                         "reasoning": reas,
                         "total": tot,
                     }
-            elif sub == "task_complete":
-                tr = ensure_turn(pl.get("turn_id"), ts)
+            elif sub in ("task_complete", "turn_aborted"):
+                tid = (pl.get("turn_attribution") or {}).get("turn_id") or pl.get("turn_id")
+                tr = ensure_turn(tid, ts)
                 tr["ended_at"] = ts
-                tr["status"] = "completed"
+                if sub == "turn_aborted" or pl.get("status") == "aborted":
+                    tr["status"] = "aborted"
+                elif tr["status"] != "aborted":
+                    if pl.get("error") or pl.get("status") in ("error", "failed"):
+                        tr["status"] = "failed"
+                    elif tr["status"] == "running":
+                        tr["status"] = "completed"
                 if pl.get("last_agent_message"):
                     tr["final_message"] = pl["last_agent_message"]
 
@@ -409,55 +418,89 @@ def build_state(limit=25):
         sessions.append(item)
         by_sid[th["session_id"]] = item
 
-    # Merge any active running ag_to_codex dispatch not yet reflected in a rollout file
+    # Match dispatches to the corresponding turn before showing dispatch-only runs.
+    matched_turns = set()
     for d in reversed(dispatches):
-        if d.get("direction", "ag_to_codex") != "ag_to_codex" or d.get("status") != "running":
+        if d.get("direction", "ag_to_codex") != "ag_to_codex":
             continue
+        status = d.get("status")
+        try:
+            if int(d.get("exit_code") or 0) != 0:
+                status = "failed"
+        except (TypeError, ValueError):
+            pass
         sid = d.get("session_id") or ""
-        if sid and sid in by_sid:
-            if by_sid[sid]["status"] != "running":
-                by_sid[sid]["status"] = "running"
-            continue
         d_ms = to_epoch_ms(d.get("started_at")) or 0
+        session = by_sid.get(sid)
+        if session:
+            turns = session["turns"]
+            rollout_turns = [t for t in turns if t["turn_id"] != "pending"]
+            if d_ms:
+                candidates = [
+                    t for t in rollout_turns
+                    if t["started_ms"] is not None and -5000 <= t["started_ms"] - d_ms < 120_000
+                    and (to_epoch_ms(t["ended_at"]) or d_ms) >= d_ms
+                ]
+                turn = min(candidates, key=lambda t: (abs(t["started_ms"] - d_ms), t["started_ms"] < d_ms), default=None)
+            else:
+                turn = rollout_turns[-1] if rollout_turns else None
+            if turn is not None:
+                key = (sid, turn["turn_id"])
+                if key not in matched_turns and status in ("running", "completed", "failed"):
+                    matched_turns.add(key)
+                    if status == "failed" and turn["status"] != "aborted":
+                        turn["status"] = "failed"
+                        session["status"] = turns[-1]["status"]
+                continue
+            if turns and (turns[-1]["turn_id"] == "pending" or (turns[-1]["started_ms"] or 0) > d_ms):
+                continue
+        if status not in ("running", "failed"):
+            continue
         d_root = path_key(d.get("target_root", ""))
-        matched = False
-        for s in sessions:
-            if path_key(s["cwd"]) == d_root and s["turns"] and (s["turns"][-1].get("started_ms") or 0) >= d_ms - 5000:
-                matched = True
-                break
-        if matched:
+        if not sid and status == "running" and any(
+            path_key(s["cwd"]) == d_root and s["turns"] and (s["turns"][-1].get("started_ms") or 0) >= d_ms - 5000
+            for s in sessions
+        ):
             continue
         cwd = clean_path(d.get("target_root", ""))
-        sessions.insert(0, {
-            "session_id": d.get("dispatch_id", "pending"),
+        turn = {
+            "turn_id": "pending",
+            "started_ms": d_ms,
+            "started_fmt": fmt_ts(d.get("started_at")),
+            "ended_fmt": "-",
+            "duration_s": None,
+            "status": status,
+            "model": d.get("model") or "config default",
+            "dispatcher_model": d.get("dispatcher_model") or "",
+            "effort": d.get("effort") or "medium",
+            "cwd": cwd,
+            "prompt": strip_discipline_footer(d.get("prompt_preview") or ""),
+            "final_message": "",
+            "events": [{"kind": "commentary", "ts": fmt_ts(d.get("started_at")), "text": "任务已派发，等待 Codex 启动并写入事件流..."}] if status == "running" else [],
+            "files": [],
+            "cmd_count": 0,
+            "tokens": None,
+        }
+        if session:
+            session["turns"].append(turn)
+            session.update(status=status, updated_fmt=turn["started_fmt"], updated_ms=d_ms)
+            continue
+        session = {
+            "session_id": sid or d.get("dispatch_id") or "pending",
             "direction": "ag_to_codex",
             "cwd": cwd,
             "project": pathlib.Path(cwd).name if cwd else "unknown",
-            "model": d.get("model") or "config default",
-            "effort": d.get("effort") or "medium",
-            "updated_fmt": fmt_ts(d.get("started_at")),
+            "model": turn["model"],
+            "effort": turn["effort"],
+            "updated_fmt": turn["started_fmt"],
             "updated_ms": d_ms,
             "tokens_used": 0,
-            "status": "running",
-            "turns": [{
-                "turn_id": "pending",
-                "started_ms": d_ms,
-                "started_fmt": fmt_ts(d.get("started_at")),
-                "ended_fmt": "-",
-                "duration_s": None,
-                "status": "running",
-                "model": d.get("model") or "config default",
-                "dispatcher_model": d.get("dispatcher_model") or "",
-                "effort": d.get("effort") or "medium",
-                "cwd": cwd,
-                "prompt": strip_discipline_footer(d.get("prompt_preview", "")),
-                "final_message": "",
-                "events": [{"kind": "commentary", "ts": fmt_ts(d.get("started_at")), "text": "任务已派发，等待 Codex 启动并写入事件流..."}],
-                "files": [],
-                "cmd_count": 0,
-                "tokens": None,
-            }],
-        })
+            "status": status,
+            "turns": [turn],
+        }
+        sessions.insert(0, session)
+        if sid:
+            by_sid[sid] = session
 
     sessions.sort(key=lambda s: (s.get("status") == "running", int(s.get("updated_ms") or 0)), reverse=True)
 
@@ -501,6 +544,20 @@ def compute_fingerprint():
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        port = self.server.server_address[1]
+        hosts = self.headers.get_all("Host", [])
+        if len(hosts) != 1 or hosts[0].lower() not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            self.send_error(403)
+            return False
+        return True
+
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
     def do_GET(self):
         if self.path.startswith("/api/state"):
             body = json.dumps(build_state(), ensure_ascii=False).encode("utf-8")

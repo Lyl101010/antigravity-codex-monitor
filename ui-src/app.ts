@@ -167,22 +167,20 @@ function formatRichText(text: string): string {
   if (!text) return '';
   const lines = text.replace(/\r\n/g, '\n').trim().split('\n');
   const out: string[] = [];
+  const listPattern = /^(\s*)([-*]|\d+\.)\s+(\S.*)$/;
   let i = 0;
 
   while (i < lines.length) {
     const line = lines[i];
+    i += 1;
     const trimmed = line.trim();
 
-    if (!trimmed) {
-      i += 1;
-      continue;
-    }
+    if (!trimmed) continue;
 
     // Fenced code block
     const fence = trimmed.match(/^```(\S*)/);
     if (fence) {
       const buf: string[] = [];
-      i += 1;
       while (i < lines.length && !lines[i].trim().startsWith('```')) {
         buf.push(lines[i]);
         i += 1;
@@ -195,7 +193,6 @@ function formatRichText(text: string): string {
     // Horizontal rule
     if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
       out.push('<hr class="md-hr" />');
-      i += 1;
       continue;
     }
 
@@ -204,14 +201,13 @@ function formatRichText(text: string): string {
     if (heading) {
       const lvl = Math.min(4, heading[1].length);
       out.push(`<h${lvl + 1} class="md-h md-h${lvl}">${formatInline(heading[2])}</h${lvl + 1}>`);
-      i += 1;
       continue;
     }
 
     // GFM Table
-    if (trimmed.includes('|') && i + 1 < lines.length && isTableDivider(lines[i + 1])) {
+    if (trimmed.includes('|') && i < lines.length && isTableDivider(lines[i])) {
       const headers = splitTableRow(trimmed);
-      i += 2;
+      i += 1;
       const rows: string[][] = [];
       while (i < lines.length) {
         const rowLine = lines[i].trim();
@@ -231,7 +227,7 @@ function formatRichText(text: string): string {
 
     // Blockquote
     if (trimmed.startsWith('>')) {
-      const qLines: string[] = [];
+      const qLines = [trimmed.replace(/^>\s?/, '')];
       while (i < lines.length && lines[i].trim().startsWith('>')) {
         qLines.push(lines[i].trim().replace(/^>\s?/, ''));
         i += 1;
@@ -241,18 +237,17 @@ function formatRichText(text: string): string {
     }
 
     // Unordered or ordered list (with nested indent support)
-    const listMatch = line.match(/^(\s*)([-*]|\d+\.)\s+(.+)$/);
-    if (listMatch) {
-      const ordered = /^\d+\.$/.test(listMatch[2]);
+    let item = line.match(listPattern);
+    if (item) {
+      const ordered = /^\d+\.$/.test(item[2]);
       const tag = ordered ? 'ol' : 'ul';
       const items: string[] = [];
-      while (i < lines.length) {
-        const m = lines[i].match(/^(\s*)([-*]|\d+\.)\s+(.+)$/);
-        if (!m) break;
-        const mOrd = /^\d+\.$/.test(m[2]);
-        if (m[1].length === 0 && mOrd !== ordered) break;
-        const nested = m[1].length >= 2;
-        items.push(`<li${nested ? ' class="nested-li"' : ''}>${formatInline(m[3])}</li>`);
+      while (true) {
+        const nested = item[1].length >= 2;
+        items.push(`<li${nested ? ' class="nested-li"' : ''}>${formatInline(item[3])}</li>`);
+        if (i === lines.length) break;
+        item = lines[i].match(listPattern);
+        if (!item || (item[1].length === 0 && /^\d+\.$/.test(item[2]) !== ordered)) break;
         i += 1;
       }
       out.push(`<${tag} class="rich-list${ordered ? ' ordered' : ''}">${items.join('')}</${tag}>`);
@@ -260,7 +255,7 @@ function formatRichText(text: string): string {
     }
 
     // Normal paragraph (merge consecutive plain lines, respecting explicit line breaks)
-    const para: string[] = [];
+    const para = [formatInline(trimmed)];
     while (i < lines.length) {
       const cur = lines[i];
       const ct = cur.trim();
@@ -270,7 +265,7 @@ function formatRichText(text: string): string {
         ct.startsWith('>') ||
         /^(#{1,4})\s+/.test(ct) ||
         /^(-{3,}|\*{3,}|_{3,})$/.test(ct) ||
-        /^(\s*)([-*]|\d+\.)\s+/.test(cur) ||
+        listPattern.test(cur) ||
         (ct.includes('|') && i + 1 < lines.length && isTableDivider(lines[i + 1]))
       ) {
         break;
@@ -278,9 +273,7 @@ function formatRichText(text: string): string {
       para.push(formatInline(ct));
       i += 1;
     }
-    if (para.length) {
-      out.push(`<p>${para.join('<br />')}</p>`);
-    }
+    out.push(`<p>${para.join('<br />')}</p>`);
   }
   return out.join('');
 }
@@ -569,9 +562,12 @@ function render(): void {
         else if (prev.kind !== 'add') prev.kind = f.kind;
       }
 
-      const summaryBits: string[] = [];
-      if (isRun) summaryBits.push('正在执行');
-      else summaryBits.push('已完成执行');
+      const terminalBadge = t.status === 'failed'
+        ? '<span class="step-pill st-err">执行失败</span>'
+        : t.status === 'aborted'
+          ? '<span class="step-pill st-run">已中止</span>'
+          : '';
+      const summaryBits = [terminalBadge || (isRun ? '正在执行' : '已完成执行')];
       if (t.cmd_count > 0) summaryBits.push(`${t.cmd_count} 条命令`);
       if (dedupFiles.length > 0) summaryBits.push(`${dedupFiles.length} 个文件`);
       if (durHtml) summaryBits.push(durHtml);
@@ -675,7 +671,7 @@ function render(): void {
                         ${stepsHtml || '<div class="step-wait">正在等待返回第一步动作...</div>'}
                       </div>
                     </details>`
-                  : ''
+                  : terminalBadge
               }
 
               ${

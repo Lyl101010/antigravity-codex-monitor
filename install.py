@@ -6,20 +6,21 @@ import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_TARGET = Path.home() / '.gemini/config/plugins/antigravity-codex-monitor'
 APP_URI = 'ui://antigravity-codex-monitor/app.html'
+PLUGIN_NAME = 'antigravity-codex-monitor'
 
 
 def run_checked(args):
     return subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=12, check=False)
 
 
-def python_candidates(explicit=None):
-    candidates = [[explicit]] if explicit else []
-    candidates += [[sys.executable]]
+def python_candidates():
+    candidates = [[sys.executable]]
     for name in ('python3', 'python'):
         found = shutil.which(name)
         if found:
@@ -34,12 +35,12 @@ def python_candidates(explicit=None):
 
 def discover_python(explicit=None):
     probe = 'import sys,importlib.metadata; import mcp.server.fastmcp; print(sys.executable); print(importlib.metadata.version("mcp"))'
-    for cmd in python_candidates(explicit):
+    for cmd in ([[explicit]] if explicit is not None else python_candidates()):
         try:
             p = run_checked(cmd + ['-c', probe])
             lines = p.stdout.strip().splitlines()
             if p.returncode == 0 and len(lines) >= 2 and Path(lines[-2]).is_file():
-                return {'path': str(Path(lines[-2]).resolve()), 'mcp_version': lines[-1]}
+                return {'path': os.path.abspath(lines[-2]), 'mcp_version': lines[-1]}
         except (OSError, subprocess.SubprocessError):
             pass
     return None
@@ -61,41 +62,76 @@ def doctor(args):
 
 def check_target(target):
     target = target.expanduser().resolve()
-    if target == target.parent or target == Path.home().resolve() or target == ROOT or target in ROOT.parents or ROOT in target.parents or target == (Path.home()/'.codex').resolve() or (Path.home()/'.codex').resolve() in target.parents:
+    default_home = (Path.home()/'.codex').resolve()
+    codex_home = Path(os.path.abspath(os.path.expanduser(os.environ.get('CODEX_HOME') or default_home))).resolve()
+    if (
+        target == target.parent or target == Path.home().resolve()
+        or target == ROOT or target in ROOT.parents or ROOT in target.parents
+        or any(target == home or home in target.parents for home in (default_home, codex_home))
+    ):
         raise ValueError('Unsafe target directory')
     return target
 
 
+def require_owned_plugin(target):
+    manifest = target/'plugin.json'
+    if manifest.is_file():
+        try:
+            data = json.loads(manifest.read_text(encoding='utf-8'))
+        except ValueError:
+            data = None
+        if isinstance(data, dict) and data.get('name') == PLUGIN_NAME:
+            return
+    raise ValueError(f'Refusing to modify a directory without an owned {PLUGIN_NAME} manifest')
+
+
 def install(args):
+    target = check_target(args.target_dir)
+    if target.exists():
+        require_owned_plugin(target)
+        if not args.force:
+            raise FileExistsError('Target exists; use --force to replace it')
     info = doctor(args)
     py = info['python']
     warning = None
     if not py:
+        if args.python is not None:
+            raise RuntimeError(f'Explicit Python interpreter failed the mcp check: {args.python}')
         if not args.force:
             raise RuntimeError('No Python with mcp found. Run: python -m pip install mcp')
-        path = args.python or sys.executable
-        resolved = shutil.which(path) or path
-        py = {'path':str(Path(resolved).resolve()), 'mcp_version':None}
+        py = {'path':os.path.abspath(sys.executable), 'mcp_version':None}
         warning = 'Forced installation without a verified mcp interpreter; run python -m pip install mcp.'
-    target = check_target(args.target_dir)
-    if target.exists():
-        if not args.force:
-            raise FileExistsError('Target exists; use --force to replace it')
-        if not (target/'plugin.json').is_file():
-            raise ValueError('Refusing to replace a directory without plugin.json')
-        shutil.rmtree(target)
-    shutil.copytree(ROOT/'plugin', target, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-    config = {'mcpServers':{'antigravity-codex-monitor':{'command':py['path'], 'args':['${PLUGIN_ROOT}/server.py']}}}
-    (target/'mcp_config.json').write_text(json.dumps(config, indent=2)+'\n',encoding='utf-8')
-    if os.name != 'nt':
-        (target/'scripts/run-codex.sh').chmod(0o755)
+    config = {'mcpServers':{'monitor':{'command':py['path'], 'args':['${PLUGIN_ROOT}/server.py']}}}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=target.parent, prefix=f'.{target.name}-') as staging:
+        staged = Path(staging)/'plugin'
+        shutil.copytree(ROOT/'plugin', staged, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        (staged/'mcp_config.json').write_text(json.dumps(config, indent=2)+'\n',encoding='utf-8')
+        if os.name != 'nt':
+            (staged/'scripts/run-codex.sh').chmod(0o755)
+        backup = None
+        if target.exists():
+            require_owned_plugin(target)
+            if not args.force:
+                raise FileExistsError('Target exists; use --force to replace it')
+            backup = Path(staging + '.backup')
+        try:
+            if backup:
+                target.rename(backup)
+            staged.rename(target)
+        except BaseException:
+            if backup and backup.exists() and not target.exists():
+                backup.rename(target)
+            raise
+        if backup:
+            shutil.rmtree(backup)
     return {'installed':str(target), 'python':py, 'warning':warning, 'standalone_skill_conflict':info['standalone_skill_conflict']}
 
 
 def verify(args):
     target = check_target(args.target_dir)
     config = json.loads((target/'mcp_config.json').read_text(encoding='utf-8'))
-    entry = config['mcpServers']['antigravity-codex-monitor']
+    entry = config['mcpServers']['monitor']
     command = args.python or entry['command']
     cmd = [command] + [x.replace('${PLUGIN_ROOT}', str(target)) for x in entry['args']]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding='utf-8', bufsize=1)
@@ -149,8 +185,7 @@ def verify(args):
 def uninstall(args):
     target = check_target(args.target_dir)
     if target.exists():
-        if not (target/'plugin.json').is_file():
-            raise ValueError('Refusing to remove a directory without plugin.json')
+        require_owned_plugin(target)
         shutil.rmtree(target)
     return {'uninstalled':str(target)}
 

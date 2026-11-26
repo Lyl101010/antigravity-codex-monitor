@@ -21,13 +21,27 @@ if (-not (Test-Path -LiteralPath $target -PathType Container)) { throw 'TargetPa
 if ($PromptFile) { $Prompt = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $PromptFile).Path, [Text.Encoding]::UTF8) }
 if (-not $Prompt.Trim()) { throw 'Provide -Prompt or -PromptFile' }
 $root = $null
-if (Get-Command git -ErrorAction SilentlyContinue) { $root = & git -C $target rev-parse --show-toplevel 2>$null }
-$isGit = [bool]$root
+$isGit = $false
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    $old = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $root = & git -C $target rev-parse --show-toplevel 2>$null
+        $isGit = ($LASTEXITCODE -eq 0 -and [bool]$root)
+    } finally { $ErrorActionPreference = $old }
+}
 if ($isGit) { $target = $root.Trim() }
 $sandbox = if ($Mode -eq 'write') { 'workspace-write' } else { 'read-only' }
-$arguments = @('exec','-C',$target,'-s',$sandbox,'-c',"model_reasoning_effort=`"$Effort`"")
+$config = 'model_reasoning_effort="{0}"' -f $Effort
+if ($PSVersionTable.PSVersion -lt [version]'7.3' -or $PSNativeCommandArgumentPassing -eq 'Legacy' -or
+    ($PSNativeCommandArgumentPassing -eq 'Windows' -and $codex.Source -match '\.(cmd|bat|ps1)$')) {
+    $config = $config.Replace('"', '\"')
+}
+$arguments = @('exec')
+if (-not $ResumeSessionId) { $arguments += @('-C',$target) }
+$arguments += @('-s',$sandbox,'-c',$config)
 if (-not $isGit) { $arguments += '--skip-git-repo-check' }
-if ($isGit -and $Mode -eq 'write' -and -not $InPlace) { $arguments += '--worktree' }
+if (-not $ResumeSessionId -and $isGit -and $Mode -eq 'write' -and -not $InPlace) { $arguments += '--worktree' }
 if ($Model) { $arguments += @('-m',$Model) }
 if ($ResumeSessionId) { $arguments += @('resume',$ResumeSessionId) }
 $arguments += @('--json','-')
@@ -37,24 +51,34 @@ $logPath = Join-Path $codexHome 'codex-worker-dispatches.json'
 $entry = @{dispatch_id=[guid]::NewGuid().ToString(); direction='ag_to_codex'; session_id=$ResumeSessionId; target_root=$target; mode=$Mode; model=$Model; effort=$Effort; started_at=[DateTime]::UtcNow.ToString('o'); prompt_preview=$Prompt.Substring(0,[Math]::Min(4000,$Prompt.Length)); status='running'}
 function Update-Dispatch {
     $items = @()
-    if (Test-Path -LiteralPath $logPath) { $items = @([IO.File]::ReadAllText($logPath,[Text.Encoding]::UTF8) | ConvertFrom-Json) }
+    if (Test-Path -LiteralPath $logPath) { $items = [array]([IO.File]::ReadAllText($logPath,[Text.Encoding]::UTF8) | ConvertFrom-Json) }
     $items = @($items | Where-Object { $_.dispatch_id -ne $entry.dispatch_id }) + @([pscustomobject]$entry)
+    $items = @($items | Select-Object -Last 200)
     $temp = Join-Path $codexHome ('.dispatch-' + [guid]::NewGuid().ToString() + '.tmp')
     try {
         [IO.File]::WriteAllText($temp,(ConvertTo-Json -InputObject @($items) -Depth 8),[Text.UTF8Encoding]::new($false))
-        if (Test-Path -LiteralPath $logPath) { [IO.File]::Replace($temp,$logPath,$null) } else { [IO.File]::Move($temp,$logPath) }
+        if (Test-Path -LiteralPath $logPath) { [IO.File]::Replace($temp, $logPath, [NullString]::Value) } else { [IO.File]::Move($temp,$logPath) }
     } finally { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp } }
 }
 Update-Dispatch
 Write-Output "SESSION_ID: $ResumeSessionId`nWORKDIR: $target`nMODEL: $Model`nEFFORT: $Effort"
 $old = $ErrorActionPreference
-$ErrorActionPreference = 'Continue'
-$lines = $Prompt | & $codex.Source @arguments 2>&1 | ForEach-Object { $line = $_.ToString(); Write-Host $line; $line }
-$exitCode = $LASTEXITCODE
-$ErrorActionPreference = $old
-foreach ($line in $lines) {
-    try { $obj = $line | ConvertFrom-Json; if ($obj.type -eq 'thread.started') { $entry.session_id = $obj.thread_id; break } } catch {}
-}
+try {
+    $ErrorActionPreference = 'Continue'
+    $Prompt | & $codex.Source @arguments 2>&1 | ForEach-Object {
+        $line = $_.ToString()
+        Write-Host $line
+        if ($line.StartsWith('{')) {
+            $obj = $null
+            try { $obj = $line | ConvertFrom-Json -ErrorAction Stop } catch {}
+            if ($obj.type -eq 'thread.started' -and $obj.thread_id -and $entry.session_id -ne $obj.thread_id) {
+                $entry.session_id = $obj.thread_id
+                Update-Dispatch
+            }
+        }
+    }
+    $exitCode = $LASTEXITCODE
+} finally { $ErrorActionPreference = $old }
 $entry.status = if ($exitCode -eq 0) { 'completed' } else { 'failed' }
 $entry.exit_code = $exitCode
 Update-Dispatch
