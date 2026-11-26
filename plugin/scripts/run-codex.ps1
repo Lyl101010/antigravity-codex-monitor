@@ -4,9 +4,15 @@ param(
     [ValidateSet('read-only','write')][string]$Mode='write',
     [ValidateSet('low','medium','high','xhigh')][string]$Effort='medium',
     [string]$Model='', [string]$Prompt='', [string]$PromptFile='',
-    [string]$ResumeSessionId='', [switch]$InPlace
+    [string]$ResumeSessionId='', [switch]$InPlace, [string]$DispatchId=''
 )
 $ErrorActionPreference = 'Stop'
+if ($PSBoundParameters.ContainsKey('DispatchId')) {
+    if (-not $DispatchId -or $DispatchId -match '[\s\p{Cc}]' -or
+        ($DispatchId -replace '[\uD800-\uDBFF][\uDC00-\uDFFF]', '_').Length -gt 128) {
+        throw 'Invalid dispatch ID'
+    }
+} else { $DispatchId = [guid]::NewGuid().ToString() }
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $OutputEncoding = [Text.UTF8Encoding]::new($false)
 $codex = Get-Command codex -ErrorAction SilentlyContinue
@@ -48,20 +54,40 @@ $arguments += @('--json','-')
 $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
 [IO.Directory]::CreateDirectory($codexHome) | Out-Null
 $logPath = Join-Path $codexHome 'codex-worker-dispatches.json'
-$entry = @{dispatch_id=[guid]::NewGuid().ToString(); direction='ag_to_codex'; session_id=$ResumeSessionId; target_root=$target; mode=$Mode; model=$Model; effort=$Effort; started_at=[DateTime]::UtcNow.ToString('o'); prompt_preview=$Prompt.Substring(0,[Math]::Min(4000,$Prompt.Length)); status='running'}
+$entry = @{dispatch_id=$DispatchId; direction='ag_to_codex'; session_id=$ResumeSessionId; target_root=$target; mode=$Mode; model=$Model; effort=$Effort; started_at=[DateTime]::UtcNow.ToString('o'); prompt_preview=$Prompt.Substring(0,[Math]::Min(4000,$Prompt.Length)); status='running'}
 function Update-Dispatch {
-    $items = @()
-    if (Test-Path -LiteralPath $logPath) { $items = [array]([IO.File]::ReadAllText($logPath,[Text.Encoding]::UTF8) | ConvertFrom-Json) }
-    $items = @($items | Where-Object { $_.dispatch_id -ne $entry.dispatch_id }) + @([pscustomobject]$entry)
-    $items = @($items | Select-Object -Last 200)
+    $lockPath = "$logPath.lock"
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    while ($true) {
+        try { $lock = [IO.File]::Open($lockPath, [IO.FileMode]::CreateNew); break }
+        catch [IO.IOException] {
+            if ([DateTime]::UtcNow -ge $deadline) { throw }
+            Start-Sleep -Milliseconds 25
+        }
+    }
     $temp = Join-Path $codexHome ('.dispatch-' + [guid]::NewGuid().ToString() + '.tmp')
     try {
+        $items = @()
+        if (Test-Path -LiteralPath $logPath) { $items = [array]([IO.File]::ReadAllText($logPath,[Text.Encoding]::UTF8) | ConvertFrom-Json) }
+        $items = @($items | Where-Object { $_.dispatch_id -cne $entry.dispatch_id }) + @([pscustomobject]$entry)
+        $items = @($items | Select-Object -Last 200)
         [IO.File]::WriteAllText($temp,(ConvertTo-Json -InputObject @($items) -Depth 8),[Text.UTF8Encoding]::new($false))
-        if (Test-Path -LiteralPath $logPath) { [IO.File]::Replace($temp, $logPath, [NullString]::Value) } else { [IO.File]::Move($temp,$logPath) }
-    } finally { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp } }
+        for ($attempt = 0; ; $attempt++) {
+            try {
+                if (Test-Path -LiteralPath $logPath) { [IO.File]::Replace($temp, $logPath, [NullString]::Value) } else { [IO.File]::Move($temp,$logPath) }
+                break
+            } catch [IO.IOException] {
+                if ($attempt -ge 19) { throw }
+                Start-Sleep -Milliseconds 25
+            }
+        }
+    } finally {
+        try { [IO.File]::Delete($temp) }
+        finally { $lock.Dispose(); [IO.File]::Delete($lockPath) }
+    }
 }
 Update-Dispatch
-Write-Output "SESSION_ID: $ResumeSessionId`nWORKDIR: $target`nMODEL: $Model`nEFFORT: $Effort"
+Write-Output "DISPATCH_ID: $DispatchId`nSESSION_ID: $ResumeSessionId`nWORKDIR: $target`nMODEL: $Model`nEFFORT: $Effort"
 $old = $ErrorActionPreference
 try {
     $ErrorActionPreference = 'Continue'
@@ -71,7 +97,7 @@ try {
         if ($line.StartsWith('{')) {
             $obj = $null
             try { $obj = $line | ConvertFrom-Json -ErrorAction Stop } catch {}
-            if ($obj.type -eq 'thread.started' -and $obj.thread_id -and $entry.session_id -ne $obj.thread_id) {
+            if ($obj.type -eq 'thread.started' -and $obj.thread_id -and $entry.session_id -cne $obj.thread_id) {
                 $entry.session_id = $obj.thread_id
                 Update-Dispatch
             }
@@ -82,5 +108,5 @@ try {
 $entry.status = if ($exitCode -eq 0) { 'completed' } else { 'failed' }
 $entry.exit_code = $exitCode
 Update-Dispatch
-Write-Output "SESSION_ID: $($entry.session_id)`nWORKDIR: $target`nEXIT_CODE: $exitCode`nMODEL: $Model`nEFFORT: $Effort"
+Write-Output "DISPATCH_ID: $DispatchId`nSESSION_ID: $($entry.session_id)`nWORKDIR: $target`nEXIT_CODE: $exitCode`nMODEL: $Model`nEFFORT: $Effort"
 exit $exitCode

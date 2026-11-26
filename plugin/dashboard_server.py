@@ -87,7 +87,8 @@ def read_session_header(path):
         return None
 
 
-def collect_exec_threads(limit=30):
+def collect_exec_threads(limit=30, include_session_ids=(), scan_sessions=True):
+    include_session_ids = set(include_session_ids)
     by_sid = {}
 
     if STATE_DB.is_file():
@@ -96,16 +97,15 @@ def collect_exec_threads(limit=30):
             if uri.startswith("file://") and not uri.startswith("file:///"):
                 uri = "file:////" + uri.removeprefix("file://")
             with closing(sqlite3.connect(f"{uri}?mode=ro", uri=True)) as con:
-                rows = con.execute(
-                    """
+                query = """
                     SELECT id, rollout_path, cwd, created_at, updated_at, model, reasoning_effort, tokens_used
                     FROM threads
                     WHERE source = 'exec'
-                    ORDER BY updated_at DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
+                """
+                rows = con.execute(query + " ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+                if include_session_ids:
+                    placeholders = ",".join("?" for _ in include_session_ids)
+                    rows += con.execute(query + f" AND id IN ({placeholders})", tuple(include_session_ids)).fetchall()
             for r in rows:
                 rp = clean_path(r[1])
                 mtime = pathlib.Path(rp).stat().st_mtime if rp and pathlib.Path(rp).is_file() else (r[4] or 0)
@@ -125,7 +125,9 @@ def collect_exec_threads(limit=30):
 
     # Scan recent sessions alongside the database; scan all dates when it is absent.
     now = datetime.now()
-    if STATE_DB.is_file():
+    if not scan_sessions:
+        day_dirs = []
+    elif STATE_DB.is_file():
         day_dirs = [SESSIONS_DIR / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}" for day in (now - timedelta(days=delta) for delta in range(3))]
     else:
         day_dirs = [p for p in SESSIONS_DIR.glob("*/*/*") if p.is_dir()]
@@ -160,7 +162,7 @@ def collect_exec_threads(limit=30):
                 }
 
     ordered = sorted(by_sid.values(), key=lambda x: float(x.get("updated_at") or 0), reverse=True)
-    return ordered[:limit]
+    return ordered[:limit] + [th for th in ordered[limit:] if th["session_id"] in include_session_ids]
 
 
 def load_dispatches():
@@ -366,9 +368,20 @@ def parse_rollout(path_str):
     return turns
 
 
-def build_state(limit=25):
-    threads = collect_exec_threads(limit=limit)
-    dispatches = load_dispatches()
+def dispatch_session_ids(dispatches, session_id, dispatch_id):
+    ids = {session_id} if session_id else set()
+    if dispatch_id:
+        ids.add(dispatch_id)
+        ids.update(d["session_id"] for d in dispatches if d.get("dispatch_id") == dispatch_id and d.get("session_id"))
+    return ids
+
+
+def build_state(limit=25, include_session_id="", include_dispatch_id=""):
+    dispatches = [d for d in load_dispatches() if isinstance(d, dict) and d.get("direction", "ag_to_codex") == "ag_to_codex"]
+    target_sids = dispatch_session_ids(dispatches, include_session_id, include_dispatch_id)
+    threads = collect_exec_threads(limit=limit + 1, include_session_ids=target_sids)
+    can_match_pending = len(threads) <= limit
+    threads = threads[:limit] + [th for th in threads[limit:] if th["session_id"] in target_sids]
 
     sessions = []
     by_sid = {}
@@ -376,34 +389,14 @@ def build_state(limit=25):
         turns = parse_rollout(th["rollout_path"])
         if not turns:
             continue
-        # Match each turn to its recorded dispatcher_model from codex-worker-dispatches.json
-        sid_dispatches = [
-            d for d in dispatches
-            if d.get("direction", "ag_to_codex") == "ag_to_codex" and d.get("dispatcher_model") and (
-                d.get("session_id") == th["session_id"]
-                or path_key(d.get("target_root", "")) == path_key(th["cwd"])
-            )
-        ]
         for tr in turns:
-            t_ms = tr.get("started_ms") or 0
-            best_dm = ""
-            best_diff = 10**18
-            for d in sid_dispatches:
-                d_ms = to_epoch_ms(d.get("started_at")) or 0
-                diff = abs(t_ms - d_ms)
-                if d.get("session_id") == th["session_id"] and diff < 120_000 and diff < best_diff:
-                    best_diff = diff
-                    best_dm = d.get("dispatcher_model") or ""
-            if not best_dm:
-                same_sid = [d for d in sid_dispatches if d.get("session_id") == th["session_id"]]
-                if same_sid:
-                    best_dm = same_sid[-1].get("dispatcher_model") or ""
-            tr["dispatcher_model"] = best_dm
+            tr["dispatcher_model"] = ""
 
         model = th["model"] or next((t["model"] for t in reversed(turns) if t["model"]), "unknown")
         effort = th["effort"] or next((t["effort"] for t in reversed(turns) if t["effort"]), "")
         item = {
             "session_id": th["session_id"],
+            "dispatch_ids": [],
             "direction": "ag_to_codex",
             "cwd": th["cwd"],
             "project": pathlib.Path(th["cwd"]).name if th["cwd"] else "unknown",
@@ -418,11 +411,20 @@ def build_state(limit=25):
         sessions.append(item)
         by_sid[th["session_id"]] = item
 
-    # Match dispatches to the corresponding turn before showing dispatch-only runs.
     matched_turns = set()
-    for d in reversed(dispatches):
-        if d.get("direction", "ag_to_codex") != "ag_to_codex":
-            continue
+    pending = []
+
+    def attach(session, turn, dispatch, status):
+        dispatch_id = dispatch.get("dispatch_id") or ""
+        turn["dispatch_id"] = dispatch_id
+        turn["dispatcher_model"] = dispatch.get("dispatcher_model") or ""
+        if dispatch_id and dispatch_id not in session["dispatch_ids"]:
+            session["dispatch_ids"].append(dispatch_id)
+        if status == "failed" and turn["status"] != "aborted":
+            turn["status"] = "failed"
+
+    dispatches.sort(key=lambda d: to_epoch_ms(d.get("started_at")) or 0, reverse=True)
+    for d in dispatches:
         status = d.get("status")
         try:
             if int(d.get("exit_code") or 0) != 0:
@@ -433,38 +435,56 @@ def build_state(limit=25):
         d_ms = to_epoch_ms(d.get("started_at")) or 0
         session = by_sid.get(sid)
         if session:
-            turns = session["turns"]
-            rollout_turns = [t for t in turns if t["turn_id"] != "pending"]
+            rollout_turns = session["turns"]
             if d_ms:
                 candidates = [
                     t for t in rollout_turns
                     if t["started_ms"] is not None and -5000 <= t["started_ms"] - d_ms < 120_000
                     and (to_epoch_ms(t["ended_at"]) or d_ms) >= d_ms
+                    and (sid, t["turn_id"]) not in matched_turns
                 ]
                 turn = min(candidates, key=lambda t: (abs(t["started_ms"] - d_ms), t["started_ms"] < d_ms), default=None)
             else:
                 turn = rollout_turns[-1] if rollout_turns else None
-            if turn is not None:
-                key = (sid, turn["turn_id"])
-                if key not in matched_turns and status in ("running", "completed", "failed"):
-                    matched_turns.add(key)
-                    if status == "failed" and turn["status"] != "aborted":
-                        turn["status"] = "failed"
-                        session["status"] = turns[-1]["status"]
+            if turn is not None and (sid, turn["turn_id"]) not in matched_turns:
+                matched_turns.add((sid, turn["turn_id"]))
+                attach(session, turn, d, status)
+                session["status"] = rollout_turns[-1]["status"]
                 continue
-            if turns and (turns[-1]["turn_id"] == "pending" or (turns[-1]["started_ms"] or 0) > d_ms):
-                continue
-        if status not in ("running", "failed"):
+        if status in ("running", "failed"):
+            pending.append((d, status, sid, d_ms))
+
+    # Before thread.started, require a unique new rollout with the dispatch's prompt and cwd.
+    known_sids = {d.get("session_id") for d in dispatches if d.get("session_id")}
+    pending_matches = {}
+    match_counts = {}
+    for index, (d, status, sid, d_ms) in enumerate(pending):
+        root = path_key(d.get("target_root"))
+        preview = strip_discipline_footer(d.get("prompt_preview") or "")
+        if not can_match_pending or sid or status != "running" or not (d_ms and root and preview):
             continue
-        d_root = path_key(d.get("target_root", ""))
-        if not sid and status == "running" and any(
-            path_key(s["cwd"]) == d_root and s["turns"] and (s["turns"][-1].get("started_ms") or 0) >= d_ms - 5000
-            for s in sessions
-        ):
+        candidates = []
+        for session in sessions:
+            turn = session["turns"][0]
+            if (session["session_id"] not in known_sids and path_key(session["cwd"]) == root
+                    and 0 <= (turn["started_ms"] or 0) - d_ms < 120_000
+                    and (turn["prompt"] == preview or (len(preview) == 4000 and turn["prompt"].startswith(preview)))):
+                candidates.append(session)
+                candidate_sid = session["session_id"]
+                match_counts[candidate_sid] = match_counts.get(candidate_sid, 0) + 1
+        if len(candidates) == 1:
+            pending_matches[index] = candidates[0]
+
+    for index, (d, status, sid, d_ms) in enumerate(pending):
+        match = pending_matches.get(index)
+        if match and match_counts[match["session_id"]] == 1:
+            attach(match, match["turns"][0], d, status)
             continue
+        session = by_sid.get(sid)
         cwd = clean_path(d.get("target_root", ""))
         turn = {
-            "turn_id": "pending",
+            "turn_id": "pending-" + d["dispatch_id"] if session and d.get("dispatch_id") else "pending",
+            "dispatch_id": d.get("dispatch_id") or "",
             "started_ms": d_ms,
             "started_fmt": fmt_ts(d.get("started_at")),
             "ended_fmt": "-",
@@ -482,11 +502,16 @@ def build_state(limit=25):
             "tokens": None,
         }
         if session:
-            session["turns"].append(turn)
-            session.update(status=status, updated_fmt=turn["started_fmt"], updated_ms=d_ms)
+            turns = session["turns"]
+            turns.append(turn)
+            turns.sort(key=lambda t: t.get("started_ms") or 0)
+            attach(session, turn, d, status)
+            if turns[-1] is turn and not (session["status"] == "aborted" and status == "running"):
+                session.update(status=status, updated_fmt=turn["started_fmt"], updated_ms=d_ms)
             continue
         session = {
             "session_id": sid or d.get("dispatch_id") or "pending",
+            "dispatch_ids": [d["dispatch_id"]] if d.get("dispatch_id") else [],
             "direction": "ag_to_codex",
             "cwd": cwd,
             "project": pathlib.Path(cwd).name if cwd else "unknown",
@@ -503,15 +528,21 @@ def build_state(limit=25):
             by_sid[sid] = session
 
     sessions.sort(key=lambda s: (s.get("status") == "running", int(s.get("updated_ms") or 0)), reverse=True)
+    visible = sessions[:limit]
+    for session in sessions[limit:]:
+        if ((include_session_id and session["session_id"] == include_session_id) or
+                (include_dispatch_id and (session["session_id"] == include_dispatch_id or
+                                          include_dispatch_id in session["dispatch_ids"]))):
+            visible.append(session)
 
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "server_time_ms": int(time.time() * 1000),
-        "sessions": sessions[:limit],
+        "sessions": visible,
     }
 
 
-def compute_fingerprint():
+def compute_fingerprint(include_session_id="", include_dispatch_id=""):
     parts = []
     if DISPATCH_LOG.is_file():
         try:
@@ -520,11 +551,24 @@ def compute_fingerprint():
         except OSError:
             pass
     if STATE_DB.is_file():
-        try:
-            st = STATE_DB.stat()
-            parts.append(f"db:{st.st_mtime_ns}:{st.st_size}")
-        except OSError:
-            pass
+        for path in (STATE_DB, STATE_DB.with_name(STATE_DB.name + "-wal")):
+            try:
+                st = path.stat()
+                parts.append(f"{path.name}:{st.st_mtime_ns}:{st.st_size}")
+            except OSError:
+                pass
+        if include_session_id or include_dispatch_id:
+            dispatches = (d for d in load_dispatches() if isinstance(d, dict) and d.get("direction", "ag_to_codex") == "ag_to_codex")
+            target_sids = dispatch_session_ids(dispatches, include_session_id, include_dispatch_id)
+            for thread in collect_exec_threads(limit=0, include_session_ids=target_sids, scan_sessions=False):
+                if not thread["rollout_path"]:
+                    continue
+                path = pathlib.Path(thread["rollout_path"])
+                try:
+                    st = path.stat()
+                    parts.append(f"{path.name}:{st.st_mtime_ns}:{st.st_size}")
+                except OSError:
+                    pass
     now = datetime.now()
     if STATE_DB.is_file():
         day_dirs = [SESSIONS_DIR / f"{day.year:04d}" / f"{day.month:02d}" / f"{day.day:02d}" for day in (now - timedelta(days=delta) for delta in range(2))]

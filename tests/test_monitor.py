@@ -4,6 +4,7 @@ from http.client import HTTPConnection
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
 import sqlite3
 import subprocess
@@ -12,6 +13,7 @@ import tempfile
 import threading
 import types
 import unittest
+import uuid
 from unittest.mock import patch
 from datetime import datetime
 
@@ -75,7 +77,7 @@ class MonitorTests(unittest.TestCase):
         folder = self.path/'sessions'/datetime.now().strftime('%Y/%m/%d')
         folder.mkdir(parents=True, exist_ok=True)
         transcript = folder/f'rollout-{session_id}.jsonl'
-        header = ('2026-11-26T10:00:00Z', 'session_meta', {'id':session_id, 'source':'exec'})
+        header = ('2026-11-26T10:00:00Z', 'session_meta', {'id':session_id, 'source':'exec', 'cwd':'/workspace/demo'})
         transcript.write_text('\n'.join(
             json.dumps(dict(timestamp=stamp, type=kind, payload=payload))
             for stamp, kind, payload in (header, *events)
@@ -94,7 +96,7 @@ class MonitorTests(unittest.TestCase):
             sid = f's{idx}'
             self.write_rollout(sid, (start, 'turn_context', {'turn_id':'t1'}),
                                (end, 'event_msg', dict(event, turn_id='t1')))
-            dispatches.append({'session_id':sid, 'started_at':start, 'status':'running'})
+            dispatches.append({'session_id':sid, 'started_at':start, 'status':'running', 'dispatch_id':f'd{idx}'})
         self.dashboard.DISPATCH_LOG.write_text(json.dumps(dispatches), encoding='utf-8')
         sessions = {s['session_id']:s for s in self.dashboard.build_state()['sessions']}
         for idx, (expected, _) in enumerate(outcomes):
@@ -103,7 +105,64 @@ class MonitorTests(unittest.TestCase):
             with self.subTest(session=idx):
                 self.assertEqual(session['status'], expected)
                 self.assertEqual(turn['status'], expected)
+                self.assertEqual(turn['dispatch_id'], f'd{idx}')
                 self.assertEqual(turn['duration_s'], 25)
+
+    def test_dispatch_migrates_and_resumes_with_a_new_id(self):
+        start, resumed = '2026-11-26T10:00:00Z', '2026-11-26T10:01:00Z'
+        first = {'dispatch_id':'first', 'status':'running', 'started_at':start, 'target_root':'/workspace/demo',
+                 'prompt_preview':'Inspect cache', 'dispatcher_model':'dispatcher'}
+        log = self.dashboard.DISPATCH_LOG
+        log.write_text(json.dumps([first]), encoding='utf-8')
+        pending, = self.dashboard.build_state()['sessions']
+        self.assertEqual((pending['session_id'], pending['dispatch_ids']), ('first', ['first']))
+        self.assertEqual(pending['turns'][0]['dispatch_id'], 'first')
+
+        message = {'type':'item_completed', 'turn_id':'t1',
+                   'item':{'type':'UserMessage', 'content':[{'text':'Inspect cache'}]}}
+        self.write_rollout('sid', (start, 'turn_context', {'turn_id':'t1'}), (start, 'event_msg', message))
+        inferred, = self.dashboard.build_state()['sessions']
+        self.assertEqual((inferred['session_id'], inferred['turns'][0]['dispatch_id']), ('sid', 'first'))
+
+        first.update(session_id='sid', status='completed')
+        second = dict(first, dispatch_id='second', status='running', started_at=resumed, dispatcher_model='new-dispatcher')
+        log.write_text(json.dumps([second, first]), encoding='utf-8')
+        self.write_rollout('sid', (start, 'turn_context', {'turn_id':'t1'}),
+                           (start, 'event_msg', {'type':'task_complete', 'turn_id':'t1'}))
+        session, = self.dashboard.build_state()['sessions']
+        self.assertEqual([(t['dispatch_id'], t['status']) for t in session['turns']],
+                         [('first', 'completed'), ('second', 'running')])
+
+        self.write_rollout('sid', (start, 'turn_context', {'turn_id':'t1'}),
+                           (start, 'event_msg', {'type':'task_complete', 'turn_id':'t1'}),
+                           (resumed, 'turn_context', {'turn_id':'t2'}))
+        session, = self.dashboard.build_state()['sessions']
+        self.assertCountEqual(session['dispatch_ids'], ['first', 'second'])
+        self.assertEqual([(t['turn_id'], t['dispatch_id'], t['dispatcher_model']) for t in session['turns']],
+                         [('t1', 'first', 'dispatcher'), ('t2', 'second', 'new-dispatcher')])
+
+    def test_same_directory_pending_dispatches_stay_distinct(self):
+        old, start = '2026-11-26T09:59:59Z', '2026-11-26T10:00:00Z'
+        message = {'type':'item_completed', 'turn_id':'t1',
+                   'item':{'type':'UserMessage', 'content':[{'text':'Inspect cache'}]}}
+        self.write_rollout('older', (old, 'turn_context', {'turn_id':'t1'}), (old, 'event_msg', message))
+        self.write_rollout('new', (start, 'turn_context', {'turn_id':'t1'}), (start, 'event_msg', message))
+        common = {'started_at':start, 'target_root':'/workspace/demo', 'status':'running', 'prompt_preview':'Inspect cache'}
+        entries = [dict(common, dispatch_id='a'), dict(common, dispatch_id='b'),
+                   dict(common, dispatch_id='unknown-sid', session_id='not-written')]
+        self.dashboard.DISPATCH_LOG.write_text(json.dumps(entries), encoding='utf-8')
+        sessions = {s['session_id']:s for s in self.dashboard.build_state()['sessions']}
+        self.assertEqual(set(sessions), {'a', 'b', 'older', 'new', 'not-written'})
+        self.assertEqual(sessions['older']['dispatch_ids'], [])
+        self.assertEqual(sessions['new']['dispatch_ids'], [])
+        for sid, dispatch in [('a', 'a'), ('b', 'b'), ('not-written', 'unknown-sid')]:
+            self.assertEqual(sessions[sid]['turns'][0]['dispatch_id'], dispatch)
+        entries[0]['session_id'] = 'new'
+        self.dashboard.DISPATCH_LOG.write_text(json.dumps(entries), encoding='utf-8')
+        sessions = {s['session_id']:s for s in self.dashboard.build_state()['sessions']}
+        self.assertNotIn('a', sessions)
+        self.assertEqual(sessions['new']['dispatch_ids'], ['a'])
+        self.assertEqual(sessions['b']['dispatch_ids'], ['b'])
 
     def test_failed_dispatches_update_the_matching_turn(self):
         first, second = '2026-11-26T10:00:00Z', '2026-11-26T10:01:00Z'
@@ -116,13 +175,15 @@ class MonitorTests(unittest.TestCase):
         for failure in ({'status':'failed'}, {'status':'completed', 'exit_code':'1'}):
             with self.subTest(failure=failure):
                 dispatches = [{'session_id':'s1', 'started_at':first, 'status':'completed', 'exit_code':'0'},
-                              dict(failure, session_id='s1', started_at=second),
+                              dict(failure, session_id='s1', started_at=second, dispatch_id='last'),
                               {'dispatch_id':'before-start', 'started_at':second, 'status':'failed'}]
                 self.dashboard.DISPATCH_LOG.write_text(json.dumps(dispatches), encoding='utf-8')
                 sessions = {s['session_id']:s for s in self.dashboard.build_state()['sessions']}
                 self.assertEqual(sessions['s1']['status'], 'failed')
                 self.assertEqual([t['status'] for t in sessions['s1']['turns']], ['completed', 'failed'])
+                self.assertEqual(sessions['s1']['turns'][-1]['dispatch_id'], 'last')
                 self.assertEqual(sessions['before-start']['turns'][0]['status'], 'failed')
+                self.assertEqual(sessions['before-start']['turns'][0]['dispatch_id'], 'before-start')
 
         failed_resume = {'session_id':'s1', 'started_at':'2026-11-26T10:01:02Z', 'status':'failed'}
         self.dashboard.DISPATCH_LOG.write_text(json.dumps([failed_resume]), encoding='utf-8')
@@ -177,22 +238,137 @@ class MonitorTests(unittest.TestCase):
         with patch.object(d.os, 'name', 'posix'):
             self.assertNotEqual(d.path_key('A/B'),d.path_key('a/b'))
 
-    def test_compact_and_resource(self):
+    def server_modules(self, calls=None):
         class FastMCP:
             def __init__(self,*a,**k): pass
             def tool(self,*a,**k): return lambda f:f
             def resource(self,*a,**k): return lambda f:f
+            def run(self):
+                if calls is not None:
+                    calls.append('mcp')
         modules = {'dashboard_server':self.dashboard,'mcp':types.ModuleType('mcp'),'mcp.server':types.ModuleType('mcp.server'),'mcp.server.fastmcp':types.ModuleType('mcp.server.fastmcp'),'mcp.types':types.ModuleType('mcp.types')}
         modules['mcp.server.fastmcp'].FastMCP = FastMCP
-        modules['mcp.types'].CallToolResult = object
-        modules['mcp.types'].TextContent = object
-        with patch.dict(sys.modules, modules):
-            server = load('monitor_server', ROOT/'plugin/server.py')
-            huge = {'sessions':[{'turns':[{'events':[{'kind':'command','output':'x'*1000000}]}]}]}
-            with patch.object(self.dashboard,'build_state',return_value=huge):
-                state = server._compact_state()
-            self.assertLess(len(json.dumps(state).encode()),750000)
-            self.assertIn('<html',server.codex_monitor_html().lower())
+        modules['mcp.types'].CallToolResult = types.SimpleNamespace
+        modules['mcp.types'].TextContent = types.SimpleNamespace
+        return modules
+
+    def load_server(self):
+        with patch.dict(sys.modules, self.server_modules()):
+            return load('monitor_server', ROOT/'plugin/server.py')
+
+    def test_compact_and_resource(self):
+        server = self.load_server()
+        huge = {'sessions':[{'turns':[{'events':[{'kind':'command','output':'x'*1000000}]}]}]}
+        with patch.object(self.dashboard,'build_state',return_value=huge):
+            state = server._compact_state()
+        self.assertLess(len(json.dumps(state).encode()),750000)
+        self.assertIn('<html',server.codex_monitor_html().lower())
+
+    def test_server_targets_rollout_outside_default_window(self):
+        stamp = '2026-11-26T10:00:00Z'
+        self.write_rollout('target', (stamp, 'turn_context', {'turn_id':'t1'}))
+        old_dir = self.path/'sessions/2020/01/01'
+        old_dir.mkdir(parents=True)
+        rollout = next(self.path.glob('sessions/*/*/*/rollout-target.jsonl')).rename(old_dir/'rollout-target.jsonl')
+        db_path = self.path/'state_1.sqlite'
+        with closing(sqlite3.connect(db_path)) as db, db:
+            db.execute('CREATE TABLE threads (id PRIMARY KEY, rollout_path, cwd, created_at, updated_at, model, reasoning_effort, tokens_used, source)')
+            for i in range(16):
+                path = self.write_rollout(f'recent-{i}', (stamp, 'turn_context', {'turn_id':'t1'}))
+                db.execute('INSERT INTO threads VALUES (?, ?, ?, 1, ?, "", "", 0, "exec")',
+                           (f'recent-{i}', str(path), '/workspace/demo', i+2))
+            db.execute('INSERT INTO threads VALUES ("target", ?, ?, 1, 1, "", "", 0, "exec")',
+                       (str(rollout), '/workspace/demo'))
+        self.dashboard.DISPATCH_LOG.write_text(json.dumps([
+            {'session_id':'target', 'dispatch_id':'queued', 'status':'completed', 'started_at':stamp}
+        ]), encoding='utf-8')
+        server = self.load_server()
+        with patch.object(self.dashboard, 'STATE_DB', db_path):
+            self.assertNotIn('target', {s['session_id'] for s in server.open_codex_monitor().structuredContent['sessions']})
+            opened = server.open_codex_monitor(dispatch_id='queued').structuredContent
+            self.assertEqual(opened['focus_dispatch_id'], 'queued')
+            self.assertIsInstance(opened['opened_at_ms'], int)
+            self.assertIn('target', {s['session_id'] for s in opened['sessions']})
+            state = server.get_codex_state(limit=1, session_id='target').structuredContent
+            target = next(s for s in state['sessions'] if s['session_id'] == 'target')
+            self.assertEqual(target['turns'][0]['dispatch_id'], 'queued')
+            self.assertFalse(server.get_codex_state(state['fingerprint'], limit=1, session_id='target').structuredContent['changed'])
+            with rollout.open('a', encoding='utf-8') as f:
+                f.write('\n' + json.dumps(dict(timestamp=stamp, type='event_msg', payload={'type':'task_complete', 'turn_id':'t1'})))
+            updated = server.get_codex_state(state['fingerprint'], limit=1, session_id='target').structuredContent
+            self.assertTrue(updated['changed'])
+            target = next(s for s in updated['sessions'] if s['session_id'] == 'target')
+            self.assertEqual(target['turns'][0]['status'], 'completed')
+
+    def test_compaction_prioritizes_dispatch_session_and_running(self):
+        server = self.load_server()
+        def state():
+            return {'sessions':[
+                {'session_id':sid, 'status':status, 'dispatch_ids':[did], 'turns':[{'prompt':'x'*1000}]}
+                for sid, status, did in [('recent', 'completed', 'a'), ('run', 'running', 'b'),
+                                         ('session-focus', 'completed', 'c'), ('dispatch-focus', 'completed', 'd')]
+            ]}
+        for max_bytes, ids in ((1200, ['dispatch-focus']), (2300, ['session-focus', 'dispatch-focus']),
+                               (3400, ['run', 'session-focus', 'dispatch-focus'])):
+            with self.subTest(max_bytes=max_bytes):
+                compact = server._fit_state(state(), max_bytes, 'session-focus', 'd')
+                self.assertEqual([s['session_id'] for s in compact['sessions']], ids)
+
+    def test_compaction_preserves_target_turn_and_final_utf8_budget(self):
+        start, resume = '2026-11-26T10:00:00Z', '2026-11-26T10:01:00Z'
+        huge = '测🙂\ud800' * 140_000
+        self.write_rollout('target', (start, 'turn_context', {'turn_id':'t1'}),
+                           (start, 'event_msg', {'type':'task_complete', 'turn_id':'t1', 'last_agent_message':huge}),
+                           (resume, 'turn_context', {'turn_id':'t2'}))
+        self.dashboard.DISPATCH_LOG.write_text(json.dumps([
+            {'session_id':'target', 'dispatch_id':'first', 'status':'completed', 'started_at':start},
+            {'session_id':'target', 'dispatch_id':'second', 'status':'running', 'started_at':resume},
+        ]), encoding='utf-8')
+        server = self.load_server()
+        full = server.open_codex_monitor(session_id='target', dispatch_id='first').structuredContent
+        self.assertLessEqual(len(json.dumps(full, ensure_ascii=False).encode('utf-8')), 750_000)
+        self.assertEqual((full['focus_session_id'], full['focus_dispatch_id'], full['changed']), ('target', 'first', True))
+        with patch.object(server, 'MAX_PAYLOAD_BYTES', 1000):
+            small = server.open_codex_monitor(session_id='target', dispatch_id='first').structuredContent
+        self.assertLessEqual(len(json.dumps(small, ensure_ascii=False).encode('utf-8')), 1000)
+        session, = small['sessions']
+        turn, = session['turns']
+        self.assertEqual((session['session_id'], turn['turn_id'], turn['dispatch_id']), ('target', 't1', 'first'))
+        self.assertEqual(set(session), set(full['sessions'][0]))
+        self.assertEqual(set(turn), set(full['sessions'][0]['turns'][0]))
+
+    def test_server_fingerprint_and_recovery(self):
+        server = self.load_server()
+        old = server.get_codex_state().structuredContent['fingerprint']
+        self.assertFalse(server.get_codex_state(old).structuredContent['changed'])
+        for args in ({'session_id':'target'}, {'dispatch_id':'target'}, {'limit':1}):
+            with self.subTest(args=args):
+                payload = server.get_codex_state(old, **args).structuredContent
+                self.assertTrue(payload['changed'])
+                self.assertNotEqual(payload['fingerprint'], old)
+                self.assertFalse(server.get_codex_state(payload['fingerprint'], **args).structuredContent['changed'])
+        with patch.object(server, 'MAX_PAYLOAD_BYTES', 2):
+            for result in (server.open_codex_monitor('a', 'b'), server.get_codex_state(), server.get_codex_state(old)):
+                self.assertTrue(result.isError)
+                self.assertIn('byte budget', result.structuredContent['error'])
+        with patch.object(self.dashboard, 'build_state', side_effect=OSError('read failed')):
+            self.assertTrue(server.open_codex_monitor().isError)
+            self.assertTrue(server.get_codex_state().isError)
+        self.assertTrue(server.open_codex_monitor().structuredContent['changed'])
+        self.assertTrue(server.get_codex_state().structuredContent['changed'])
+
+    def test_mcp_http_is_opt_in(self):
+        path = ROOT/'plugin/server.py'
+        for flags, env, expected in (([], {}, False), ([], {'CODEX_MONITOR_ENABLE_HTTP':'0'}, False),
+                                     (['--enable-http'], {}, True), ([], {'CODEX_MONITOR_ENABLE_HTTP':'1'}, True)):
+            with self.subTest(flags=flags, env=env):
+                calls = []
+                with patch.dict(sys.modules, self.server_modules(calls)), patch.dict(os.environ, env, clear=True), \
+                        patch.object(sys, 'argv', [str(path), *flags]), \
+                        patch.object(self.dashboard, 'ThreadingHTTPServer', side_effect=OSError) as http:
+                    runpy.run_path(str(path), run_name='__main__')
+                self.assertEqual(http.called, expected)
+                self.assertEqual(calls, ['mcp'])
 
     def test_installer_lifecycle_and_conflict(self):
         installer = load('installer', ROOT/'install.py')
@@ -225,7 +401,7 @@ class MonitorTests(unittest.TestCase):
         manifest.write_text('{"name":"foreign-plugin"}', encoding='utf-8')
         codex_home = self.path/'codex-home'
         args = types.SimpleNamespace(target_dir=foreign, python=None, force=True)
-        with patch.object(installer, 'ROOT', self.path/'source'), patch.dict(
+        with patch.object(installer, 'ROOT', self.path/'source'), patch.object(installer.Path, 'home', return_value=self.path/'home'), patch.dict(
             os.environ, {'CODEX_HOME':os.path.relpath(codex_home)}
         ):
             for operation in (installer.install, installer.uninstall):
@@ -285,7 +461,8 @@ class MonitorTests(unittest.TestCase):
         self.assertRegex(ps, r'if \(-not \$ResumeSessionId[^)\n]*\)[^\n]*--worktree')
         self.assertRegex(sh, r'(?m)^if .* -z "\$resume" .*--worktree')
         self.assertNotRegex(sh, r'(?m)^\s*export\b[^\n]*\bMONITOR_PROMPT\b')
-        forbidden = ['liyi'+'lin','App_'+'Downloads','codex_'+'to_ag','antigravity-'+'official.png','<meta name='+'"generator"']
+        forbidden = ['liyi'+'lin','App_'+'Downloads','codex_'+'to_ag','antigravity-'+'official.png',
+                     '<meta name='+'"generator"','gpt-6.2'+'-sol']
         for parent in ('plugin','ui-src'):
             for file in (ROOT/parent).rglob('*'):
                 if file.is_file() and 'node_modules' not in file.parts and '__pycache__' not in file.parts:
@@ -311,7 +488,11 @@ class MonitorTests(unittest.TestCase):
         stub = self.path/'codex_stub.py'
         stub.write_text('''import json, os, pathlib, sys, time
 prompt = sys.stdin.read()
-print(json.dumps({"type":"thread.started", "thread_id":"test-session"}), flush=True)
+thread_id = os.environ.get("TEST_THREAD_ID", "test-session")
+dispatch_id = os.environ.get("TEST_DISPATCH_ID")
+if os.environ.get("TEST_EXIT_BEFORE_START"):
+    sys.exit(int(os.environ["TEST_EXIT_BEFORE_START"]))
+print(json.dumps({"type":"thread.started", "thread_id":thread_id}), flush=True)
 if os.environ.get("TEST_REQUIRE_LIVE") == "1":
     log = pathlib.Path(os.environ["CODEX_HOME"])/"codex-worker-dispatches.json"
     for _ in range(100):
@@ -319,7 +500,8 @@ if os.environ.get("TEST_REQUIRE_LIVE") == "1":
             rows = json.loads(log.read_text(encoding="utf-8-sig"))
         except OSError:
             rows = []
-        if rows and rows[-1]["session_id"] == "test-session" and rows[-1]["status"] == "running":
+        if any(row.get("session_id") == thread_id and row.get("status") == "running"
+               and (dispatch_id is None or row.get("dispatch_id") == dispatch_id) for row in rows):
             break
         time.sleep(0.05)
     else:
@@ -335,7 +517,7 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
                    TEST_BIN=bin_dir.as_posix(), TEST_RESULT=result.as_posix(), TEST_GIT_ROOT=target.as_posix())
         return bin_dir, target, prompt, result, env
 
-    def check_launcher(self, command, result, env, expected_args, expected_exit=0):
+    def check_launcher(self, command, result, env, expected_args, expected_exit=0, dispatch_id=None):
         completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    env=env, cwd=ROOT, timeout=20, encoding='utf-8', errors='replace')
         self.assertEqual(completed.returncode, expected_exit, completed.stdout + completed.stderr)
@@ -348,6 +530,52 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
         self.assertEqual(actual_args, expected_args)
         self.assertEqual(captured['prompt_size'], 140_000)
         self.assertEqual(captured['metadata'], [])
+        ids = [line.split(': ', 1)[1] for line in completed.stdout.splitlines() if line.startswith('DISPATCH_ID: ')]
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(ids[0], ids[1])
+        if dispatch_id:
+            self.assertEqual(ids[0], dispatch_id)
+        else:
+            self.assertEqual(uuid.UUID(ids[0]).version, 4)
+        return ids[0]
+
+    def check_dispatch_log_concurrency(self, command, flag, env):
+        def invoke(extra_args, **overrides):
+            return subprocess.Popen(command + extra_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env={**env, **overrides}, cwd=ROOT, encoding='utf-8', errors='replace')
+
+        log = self.dashboard.DISPATCH_LOG
+        before = log.read_bytes()
+        for invalid in ('', ' \t', 'with space', 'with\x7fcontrol', 'x'*129):
+            with self.subTest(invalid=invalid), invoke([flag, invalid]) as process:
+                process.communicate(timeout=20)
+                self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(log.read_bytes(), before)
+
+        with invoke([flag, 'startup-failure'], TEST_EXIT_BEFORE_START='11') as process:
+            out, err = process.communicate(timeout=20)
+            self.assertEqual(process.returncode, 11, out + err)
+            self.assertEqual(out.splitlines().count('DISPATCH_ID: startup-failure'), 2)
+        failure = next(row for row in json.loads(log.read_bytes()) if row['dispatch_id'] == 'startup-failure')
+        self.assertEqual((failure['session_id'], failure['status'], int(failure['exit_code'])), ('', 'failed', 11))
+
+        runs = []
+        try:
+            for i, dispatch in enumerate(('Concurrent', 'concurrent', 'third')):
+                runs.append((dispatch, f'thread-{i}', invoke([flag, dispatch], TEST_EXIT='0', TEST_REQUIRE_LIVE='1',
+                             TEST_THREAD_ID=f'thread-{i}', TEST_DISPATCH_ID=dispatch, TEST_RESULT=str(self.path/f'argv-{i}.json'))))
+            for dispatch, _, process in runs:
+                out, err = process.communicate(timeout=30)
+                self.assertEqual(process.returncode, 0, out + err)
+                self.assertEqual(out.splitlines().count(f'DISPATCH_ID: {dispatch}'), 2)
+        finally:
+            for _, _, process in runs:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
+        rows = {row['dispatch_id']:row for row in json.loads(log.read_bytes())}
+        for dispatch, sid, _ in runs:
+            self.assertEqual((rows[dispatch]['session_id'], rows[dispatch]['status'], rows[dispatch]['model']), (sid, 'completed', ''))
 
     @unittest.skipUnless(shutil.which('bash'), 'Bash is unavailable')
     def test_bash_launch_arguments_and_prompt_scope(self):
@@ -363,19 +591,23 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
             path.chmod(0o755)
         env['TMPDIR'] = self.path.name
         env['CODEX_HOME'] = self.path.name
+        env['TEST_REQUIRE_LIVE'] = '1'
         command = [shutil.which('bash'), '-c',
                    'export PATH="$(CDPATH= cd "$TEST_BIN" && pwd -P):$PATH" CDPATH=.; '
                    'exec bash plugin/scripts/run-codex.sh "$@"',
                    'launcher', '--target-path', target.relative_to(ROOT).as_posix(), '--prompt-file', prompt.as_posix(),
                    '--model', 'test-model']
         options = ['-s', 'workspace-write', '-c', 'model_reasoning_effort="medium"']
-        self.check_launcher(command, result, env,
-                            ['exec', '-C', str(target), *options, '--worktree', '-m', 'test-model', '--json', '-'])
-        self.check_launcher(command+['--resume', 'test-session'], result, env,
-                            ['exec', *options, '-m', 'test-model', 'resume', 'test-session', '--json', '-'])
+        generated = self.check_launcher(command, result, env,
+                                        ['exec', '-C', str(target), *options, '--worktree', '-m', 'test-model', '--json', '-'])
+        self.check_launcher(command+['--resume', 'test-session', '--dispatch-id', '/explicit/bash'], result, env,
+                            ['exec', *options, '-m', 'test-model', 'resume', 'test-session', '--json', '-'],
+                            dispatch_id='/explicit/bash')
         records = json.loads(self.dashboard.DISPATCH_LOG.read_text(encoding='utf-8'))
+        self.assertEqual([d['dispatch_id'] for d in records], [generated, '/explicit/bash'])
         self.assertEqual([d['session_id'] for d in records], ['test-session', 'test-session'])
         self.assertEqual(records[-1]['prompt_preview'], 'p' * 4000)
+        self.check_dispatch_log_concurrency(command[:-2], '--dispatch-id', env)
 
     @unittest.skipUnless(os.name == 'nt' and shutil.which('powershell'), 'Windows PowerShell is unavailable')
     def test_windows_powershell_launch_and_live_dispatch(self):
@@ -395,8 +627,9 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
         options = ['-s', 'workspace-write', '-c', 'model_reasoning_effort="medium"']
         self.check_launcher(command, result, env,
                             ['exec', '-C', str(target), *options, '--worktree', '-m', 'test-model', '--json', '-'])
-        self.check_launcher(command+['-ResumeSessionId', 'test-session'], result, env,
-                            ['exec', *options, '-m', 'test-model', 'resume', 'test-session', '--json', '-'])
+        self.check_launcher(command+['-ResumeSessionId', 'test-session', '-DispatchId', 'ps:explicit'], result, env,
+                            ['exec', *options, '-m', 'test-model', 'resume', 'test-session', '--json', '-'],
+                            dispatch_id='ps:explicit')
         env.update(TEST_GIT_ROOT='', TEST_EXIT='9')
         self.check_launcher(command, result, env,
                             ['exec', '-C', str(target), *options, '--skip-git-repo-check', '-m', 'test-model', '--json', '-'],
@@ -405,8 +638,10 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
         self.assertEqual(len(entries), 200)
         self.assertEqual(entries[0]['dispatch_id'], '3')
         self.assertEqual([row['session_id'] for row in entries[-3:]], ['test-session'] * 3)
+        self.assertEqual(entries[-2]['dispatch_id'], 'ps:explicit')
         self.assertEqual(entries[-1]['status'], 'failed')
         self.assertEqual(entries[-1]['exit_code'], 9)
+        self.check_dispatch_log_concurrency(command[:-2], '-DispatchId', env)
 
     @unittest.skipUnless(shutil.which('node'), 'Node.js is unavailable')
     def test_rich_text_blank_bullets_and_turn_badges(self):
@@ -424,6 +659,7 @@ const context = {
   document: { getElementById: (id) => id === 'chat-feed' ? feed : null, querySelectorAll: () => [] },
   expandedKeys: new Set(), userToggledTraces: new Map(),
   GEMINI_SVG: '', OPENAI_SVG: '', autoFollow: false, searchQuery: '', selectedSid: null,
+  pinnedTarget: null, runningAtPinRelease: null,
 };
 vm.runInNewContext(code, context);
 assert.equal(context.formatRichText('hello\n- \nnext'), '<p>hello<br />-<br />next</p>');
@@ -438,6 +674,141 @@ for (const [status, label, events] of [
   assert.ok(feed.innerHTML.includes(label));
   assert.doesNotMatch(feed.innerHTML, /正在执行|已完成执行/);
 }
+'''
+        subprocess.run([shutil.which('node'), '-e', script], cwd=ROOT/'ui-src', check=True, timeout=10)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is unavailable')
+    def test_ui_focus_and_poll_races(self):
+        script = r'''
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const { transformSync } = require('esbuild');
+const source = fs.readFileSync('app.ts', 'utf8');
+assert.doesNotMatch(source, /\/api\/events/);
+const { code } = transformSync(source.replace(/^import \{[\s\S]*?\} from '[^']+';/, '').replace('void boot();', ''), { loader: 'ts' });
+
+function fixture({ web = false, search = '' } = {}) {
+  const badge = {}, labels = {}, input = {}, selector = {}, scrolls = [], intervals = [], requests = [];
+  const feed = { children: { item: (index) => ({ scrollIntoView: () => scrolls.push(index) }) } };
+  const follow = { classList: { toggle() {} }, setAttribute() {} };
+  const nodes = {
+    'live-pill': { classList: { toggle: (key, value) => { badge[key] = value; } } },
+    'live-text': labels, 'side-search': input, 'follow-btn': follow, 'sess-select': selector,
+    'chat-feed': feed, 'chat-scroll': { scrollTo: () => scrolls.push('bottom') },
+  };
+  const bridge = { callServerTool: (args) => new Promise((resolve) => requests.push({ args, resolve })) };
+  const window = {};
+  window.parent = web ? window : {};
+  const context = vm.createContext({
+    window, location: { search }, URLSearchParams, App: function () { return bridge; },
+    fetch: async (url) => ({ ok: url === '/api/state', json: async () => ({ sessions: [] }) }),
+    setInterval: (_fn, delay) => intervals.push(delay),
+    document: { getElementById: (id) => nodes[id], querySelectorAll: () => [], documentElement: { setAttribute() {} } },
+  });
+  vm.runInContext(code, context);
+  const read = (expression) => vm.runInContext(expression, context);
+  const query = (value) => { input.value = value; input.oninput(); };
+  return { read, bridge, query, input, follow, selector, badge, feed, scrolls, intervals, requests };
+}
+
+function turn(turn_id, status, dispatch_id) {
+  return { turn_id, status, dispatch_id, prompt: `task ${turn_id}`, final_message: '', events: [], files: [] };
+}
+function session(session_id, project, turns) {
+  return { session_id, project, cwd: project, model: 'default', status: turns.at(-1).status, turns };
+}
+
+(async () => {
+  const f = fixture();
+  f.read('wireControls()');
+  const send = (sessions, extra = {}) => f.bridge.ontoolresult({ structuredContent: { sessions, ...extra } });
+  const stale = f.read('pollNow()');
+  const existing = session('existing', 'existing project', [turn('old', 'running')]);
+  const queued = session('job', 'cache', [turn('pending', 'running', 'job')]);
+  send([existing]);
+  f.query('existing');
+  send([existing, queued], { focus_session_id: 'existing', focus_dispatch_id: 'job', fingerprint: 'opened' });
+  assert.equal(f.read('selectedSid'), 'job');
+  assert.equal(f.input.value, '');
+  assert.equal(f.read('searchQuery'), '');
+  assert.match(f.read('lastSessionTurnKey'), /^job:pending:/);
+  f.requests[0].resolve({ structuredContent: { sessions: [existing], fingerprint: 'stale' } });
+  await stale;
+  assert.equal(f.read('selectedSid'), 'job');
+  assert.equal(f.read('lastFingerprint'), 'opened');
+
+  const poll = async (content, isError = false) => {
+    const result = f.read('pollNow()');
+    const request = f.requests.at(-1);
+    request.resolve({ structuredContent: content, isError });
+    await result;
+    return request.args.arguments;
+  };
+  const real = session('real', 'cache', [turn('target-turn', 'running', 'job'), turn('other-turn', 'running', 'other')]);
+  const focusedArgs = await poll({ sessions: [existing, real], fingerprint: 'migrated' });
+  assert.equal(focusedArgs.session_id, 'existing');
+  assert.equal(focusedArgs.dispatch_id, 'job');
+  assert.equal(f.read('selectedSid'), 'real');
+  assert.equal(f.scrolls.at(-1), 0);
+
+  f.query('cache');
+  send([existing, real], { focus_dispatch_id: 'job' });
+  assert.equal(f.input.value, 'cache');
+  f.query('existing');
+  await poll({ sessions: [existing, real] });
+  assert.equal(f.input.value, 'existing');
+  send([existing], { focus_dispatch_id: 'future' });
+  assert.equal(f.input.value, 'existing');
+  const future = session('future-real', 'other project', [turn('future-turn', 'running', 'future')]);
+  await poll({ sessions: [existing, future] });
+  assert.equal(f.input.value, '');
+  assert.equal(f.read('selectedSid'), 'future-real');
+
+  const done = session('future-real', 'other project', [turn('future-turn', 'aborted', 'future')]);
+  await poll({ sessions: [existing, done] });
+  assert.equal(f.read('pinnedTarget'), null);
+  assert.equal(f.read('selectedSid'), 'future-real');
+  await poll({ sessions: [existing, done] });
+  assert.equal(f.read('selectedSid'), 'future-real');
+  const manual = session('manual', 'CLI', [turn('new', 'running')]);
+  const heldArgs = await poll({ sessions: [existing, manual, done] });
+  assert.equal(heldArgs.session_id, 'future-real');
+  assert.equal(heldArgs.dispatch_id, '');
+  assert.equal(f.read('selectedSid'), 'manual');
+
+  send([existing, real], { focus_dispatch_id: 'job' });
+  f.selector.value = 'existing';
+  f.selector.onchange();
+  assert.equal(f.read('pinnedTarget'), null);
+  assert.equal(f.read('selectedSid'), 'existing');
+  send([existing, real], { focus_dispatch_id: 'job' });
+  f.follow.onclick();
+  assert.equal(f.read('pinnedTarget'), null);
+  assert.equal(f.read('autoFollow'), false);
+  const html = f.feed.innerHTML;
+  f.bridge.ontoolresult({ isError: true, structuredContent: { sessions: [] } });
+  assert.equal(f.badge.offline, true);
+  assert.equal(f.read('autoFollow'), false);
+  assert.equal(f.read('selectedSid'), 'real');
+  assert.equal(f.feed.innerHTML, html);
+  await poll({ sessions: [] }, true);
+  assert.equal(f.feed.innerHTML, html);
+  await poll({ sessions: 'invalid', fingerprint: 'malformed' });
+  await poll({ sessions: [{ ...real, turns: [{ ...real.turns[0], events: 'invalid' }] }], fingerprint: 'malformed' });
+  assert.equal(f.feed.innerHTML, html);
+  assert.notEqual(f.read('lastFingerprint'), 'malformed');
+  assert.equal(f.badge.offline, true);
+
+  const demo = fixture({ web: true, search: '?demo=1' });
+  await demo.read('boot()');
+  assert.equal(demo.read('state.sessions.length'), 2);
+  assert.equal(demo.intervals.length, 0);
+  const web = fixture({ web: true });
+  await web.read('boot()');
+  assert.ok(web.intervals.includes(800));
+  assert.equal(web.badge.offline, false);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
 '''
         subprocess.run([shutil.which('node'), '-e', script], cwd=ROOT/'ui-src', check=True, timeout=10)
 

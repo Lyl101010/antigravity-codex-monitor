@@ -15,7 +15,7 @@ Delegate well-scoped implementation, refactoring, testing, or read-only architec
 
 Whenever you dispatch a task to Codex (Round 1 or Round 2):
 
-1. In the **same turn**, call the MCP App tool `antigravity-codex-monitor_monitor` / `open_codex_monitor` so Antigravity automatically opens or focuses the live **Codex Monitor** side pane.
+1. Pre-generate a unique `dispatch_id` (e.g., `dispatch-YYYYMMDD-HHMMSS-<4hex>`) and pass it to both the launcher script (`-DispatchId` / `--dispatch-id`) and `antigravity-codex-monitor_monitor` / `open_codex_monitor` (`{"dispatch_id": "<DISPATCH_ID>"}`, adding `"session_id": "<SESSION_ID>"` on Round 2 resumes) in the **same turn** so the live **Codex Monitor** side pane locks onto that exact turn immediately. Note: if the user manually closed the side pane earlier in the same conversation, Antigravity's host `aux_pane` policy keeps it closed until reopened from the `+` menu or left sidebar; when open, every call updates and focuses the new `dispatch_id`.
 2. Briefly inform the user in chat about the task goal, target directory, and allowed file scope.
 3. After Codex finishes, inspect the diff/files and run key verification checks independently before reporting back.
 
@@ -43,6 +43,7 @@ powershell -ExecutionPolicy Bypass -File "$HOME\.gemini\config\plugins\antigravi
   -TargetPath "<PROJECT_OR_REPO_ROOT>" `
   -Mode write `
   -Effort medium `
+  -DispatchId "<DISPATCH_ID>" `
   -PromptFile "<TEMP_PROMPT_FILE>"
 
 # Read-only review
@@ -50,6 +51,7 @@ powershell -ExecutionPolicy Bypass -File "$HOME\.gemini\config\plugins\antigravi
   -TargetPath "<PROJECT_OR_REPO_ROOT>" `
   -Mode read-only `
   -Effort medium `
+  -DispatchId "<DISPATCH_ID>" `
   -PromptFile "<TEMP_PROMPT_FILE>"
 
 # Round 2 follow-up (same session)
@@ -57,6 +59,7 @@ powershell -ExecutionPolicy Bypass -File "$HOME\.gemini\config\plugins\antigravi
   -TargetPath "<PROJECT_OR_REPO_ROOT>" `
   -Mode write `
   -Effort medium `
+  -DispatchId "<DISPATCH_ID>" `
   -ResumeSessionId "<SESSION_ID>" `
   -PromptFile "<ROUND_2_PROMPT_FILE>"
 ```
@@ -69,6 +72,7 @@ powershell -ExecutionPolicy Bypass -File "$HOME\.gemini\config\plugins\antigravi
   --target-path "<PROJECT_OR_REPO_ROOT>" \
   --mode write \
   --effort medium \
+  --dispatch-id "<DISPATCH_ID>" \
   --prompt-file "<TEMP_PROMPT_FILE>"
 
 # Read-only review
@@ -76,6 +80,7 @@ powershell -ExecutionPolicy Bypass -File "$HOME\.gemini\config\plugins\antigravi
   --target-path "<PROJECT_OR_REPO_ROOT>" \
   --mode read-only \
   --effort medium \
+  --dispatch-id "<DISPATCH_ID>" \
   --prompt-file "<TEMP_PROMPT_FILE>"
 
 # Round 2 follow-up (same session)
@@ -83,6 +88,7 @@ powershell -ExecutionPolicy Bypass -File "$HOME\.gemini\config\plugins\antigravi
   --target-path "<PROJECT_OR_REPO_ROOT>" \
   --mode write \
   --effort medium \
+  --dispatch-id "<DISPATCH_ID>" \
   --resume "<SESSION_ID>" \
   --prompt-file "<ROUND_2_PROMPT_FILE>"
 ```

@@ -12,7 +12,7 @@
 
 ## 2. 调度纪律
 
-- **自动弹出监控面板**：每次派发任务（第 1 轮与第 2 轮）都在同一轮并行调用 `antigravity-codex-monitor_monitor` 的 `open_codex_monitor`，让用户在右侧栏实时查看命令、Diff 与 Token 消耗。
+- **自动弹出/锁定监控面板**：每次派发任务（第 1 轮与第 2 轮）先预生成唯一 `dispatch_id` 传给脚本（`-DispatchId` / `--dispatch-id`），并在同一轮并行调用 `antigravity-codex-monitor_monitor` 的 `open_codex_monitor`（传入 `{"dispatch_id": "..."}`，第 2 轮续跑同时传 `"session_id"`），让右侧栏精准锁定并实时刷新当前任务。
 - **安全与隔离边界**：
   - 严格单向调用（Antigravity → 官方 `codex exec`），禁止任何反向调用 `agy`。
   - Git 写任务默认使用 `--worktree` + `workspace-write` 隔离；合并代码或 `git push` 前必须经用户明确确认。

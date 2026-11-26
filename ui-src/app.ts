@@ -12,6 +12,7 @@ type TurnEvent =
 type TokenStats = { input: number; cached: number; output: number; reasoning: number; total: number };
 type Turn = {
   turn_id: string;
+  dispatch_id?: string;
   started_ms: number | null;
   started_fmt: string;
   ended_fmt: string;
@@ -30,6 +31,7 @@ type Turn = {
 };
 type Session = {
   session_id: string;
+  dispatch_ids?: string[];
   direction?: 'ag_to_codex';
   cwd: string;
   project: string;
@@ -47,6 +49,8 @@ type DashboardState = {
   server_time_ms?: number;
   fingerprint?: string;
   focus_session_id?: string;
+  focus_dispatch_id?: string;
+  opened_at_ms?: number;
   changed?: boolean;
   sessions?: Session[];
 };
@@ -61,7 +65,11 @@ let selectedSid: string | null = null;
 let autoFollow = true;
 let searchQuery = '';
 let lastFingerprint = '';
-let pollInFlight = false;
+let stateEpoch = 0;
+let pollInFlight: number | null = null;
+let pinnedTarget: { sessionId?: string; dispatchId?: string } | null = null;
+let pinResolved = false;
+let runningAtPinRelease: Set<string> | null = null;
 let expandedKeys = new Set<string>();
 let userToggledTraces = new Map<string, boolean>();
 let userToggledGroups = new Map<string, boolean>();
@@ -337,23 +345,60 @@ function applyTheme(theme: string | undefined): void {
   }
 }
 
-function render(): void {
+function matchesSearch(s: Session): boolean {
+  const q = searchQuery.trim().toLowerCase();
+  if (!q) return true;
+  const blob = s.project + ' ' + s.cwd + ' ' + s.model + ' ' + s.turns.map((t) => t.prompt + ' ' + t.final_message).join(' ');
+  return blob.toLowerCase().includes(q);
+}
+
+function matchesDispatch(session: Session, dispatchId: string): boolean {
+  return session.session_id === dispatchId || !!session.dispatch_ids?.includes(dispatchId)
+    || session.turns.some((turn) => turn.dispatch_id === dispatchId);
+}
+
+function findPinnedSession(sessions: Session[]): Session | undefined {
+  if (!pinnedTarget) return;
+  const { dispatchId, sessionId } = pinnedTarget;
+  return (dispatchId ? sessions.find((s) => matchesDispatch(s, dispatchId)) : undefined)
+    || sessions.find((s) => s.session_id === sessionId);
+}
+
+function runningKey(session: Session): string {
+  const turn = session.turns[session.turns.length - 1];
+  return turn?.dispatch_id ? `dispatch:${turn.dispatch_id}` : `${session.session_id}:${turn?.turn_id || ''}`;
+}
+
+function findPinnedTurn(session: Session, dispatchId?: string): Turn | undefined {
+  const latest = session.turns[session.turns.length - 1];
+  if (!dispatchId) return latest;
+  return session.turns.find((turn) => turn.dispatch_id === dispatchId)
+    || (session.session_id === dispatchId && !latest?.dispatch_id ? latest : undefined);
+}
+
+function selectSession(sessionId: string | null): void {
+  pinnedTarget = null;
+  runningAtPinRelease = null;
+  const running = state.sessions?.find((s) => s.status === 'running' && matchesSearch(s));
+  lastRunningJumpKey = running ? runningKey(running) : '';
+  selectedSid = sessionId;
+  render();
+}
+
+function render(focusedTurn?: Turn): void {
   captureExpanded();
   const sessions = state.sessions || [];
-  const q = searchQuery.trim().toLowerCase();
-  const list = sessions.filter((s) => {
-    if (!q) return true;
-    const blob = s.project + ' ' + s.cwd + ' ' + s.model + ' ' + s.turns.map((t) => t.prompt + ' ' + t.final_message).join(' ');
-    return blob.toLowerCase().includes(q);
-  });
+  const list = sessions.filter(matchesSearch);
+  const pinned = findPinnedSession(sessions);
+  const running = list.find((s) => s.status === 'running' && !runningAtPinRelease?.has(runningKey(s)));
+  const nextRunningKey = running ? runningKey(running) : '';
 
-  const running = list.find((s) => s.status === 'running');
-  const runningTurnId = running?.turns[running.turns.length - 1]?.turn_id || '';
-  const runningKey = running ? `${running.session_id}:${runningTurnId}` : '';
-
-  if (autoFollow) {
-    if (running && runningKey !== lastRunningJumpKey) {
-      lastRunningJumpKey = runningKey;
+  if (pinned && matchesSearch(pinned)) {
+    selectedSid = pinned.session_id;
+  } else if (autoFollow && !pinnedTarget && !focusedTurn) {
+    if (running && nextRunningKey !== lastRunningJumpKey) {
+      runningAtPinRelease = null;
+      lastRunningJumpKey = nextRunningKey;
       selectedSid = running.session_id;
     } else if (!selectedSid || !list.some((s) => s.session_id === selectedSid)) {
       selectedSid = (running || list[0])?.session_id ?? null;
@@ -439,10 +484,7 @@ function render(): void {
       : '<div class="empty-side">暂无历史派单</div>';
 
     sideEl.querySelectorAll<HTMLButtonElement>('.side-item').forEach((btn) => {
-      btn.onclick = () => {
-        selectedSid = btn.dataset.sid || null;
-        render();
-      };
+      btn.onclick = () => selectSession(btn.dataset.sid || null);
     });
   }
 
@@ -463,6 +505,8 @@ function render(): void {
   }
 
   const latest = sess.turns[sess.turns.length - 1];
+  const dispatchId = pinnedTarget?.dispatchId;
+  const activeTurn = focusedTurn || (pinned === sess ? findPinnedTurn(sess, dispatchId) : undefined) || latest;
   const tok = latest?.tokens;
   const cachedPct = tok && tok.input ? Math.round((tok.cached / tok.input) * 100) : 0;
 
@@ -701,49 +745,101 @@ function render(): void {
   feedEl.innerHTML = blocks;
 
   // Scroll gently to bottom when a new turn arrives or while running in autoFollow
-  const turnKey = `${sess.session_id}:${sess.turns.length}:${latest?.events?.length || 0}:${latest?.status || ''}`;
+  const turnKey = `${sess.session_id}:${activeTurn?.turn_id || ''}:${activeTurn?.events?.length || 0}:${activeTurn?.status || ''}`;
   if (autoFollow && turnKey !== lastSessionTurnKey) {
     lastSessionTurnKey = turnKey;
     const scroller = document.getElementById('chat-scroll');
     if (scroller) {
-      scroller.scrollTo({ top: scroller.scrollHeight, behavior: 'smooth' });
+      if (activeTurn && activeTurn !== latest) {
+        feedEl.children.item(sess.turns.indexOf(activeTurn))?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } else {
+        scroller.scrollTo({ top: scroller.scrollHeight, behavior: 'smooth' });
+      }
     }
   }
 }
 
-function applyIncoming(next: DashboardState | undefined): void {
-  if (!next) return;
+function isDashboardState(value: unknown): value is DashboardState {
+  if (!value || typeof value !== 'object') return false;
+  const data = value as DashboardState;
+  if (data.changed === false) return typeof data.fingerprint === 'string' && !!data.fingerprint;
+  if ([data.fingerprint, data.focus_session_id, data.focus_dispatch_id].some((id) => id !== undefined && typeof id !== 'string')) return false;
+  return Array.isArray(data.sessions) && data.sessions.every((session) =>
+    session && typeof session.session_id === 'string' && Array.isArray(session.turns)
+    && (session.dispatch_ids === undefined || (Array.isArray(session.dispatch_ids) && session.dispatch_ids.every((id) => typeof id === 'string')))
+    && session.turns.every((turn) => turn && typeof turn.turn_id === 'string' && typeof turn.status === 'string'
+      && typeof turn.prompt === 'string' && typeof turn.final_message === 'string'
+      && Array.isArray(turn.files) && turn.files.every((file) => file && typeof file.path === 'string')
+      && Array.isArray(turn.events) && turn.events.every((event) => event && typeof event.kind === 'string'
+        && (event.kind !== 'commentary' || typeof event.text === 'string')
+        && (event.kind !== 'file_change' || (Array.isArray(event.changes) && event.changes.every((change) =>
+          change && typeof change.path === 'string' && typeof change.diff === 'string'))))));
+}
+
+function applyIncoming(next: DashboardState): void {
   if (next.fingerprint) lastFingerprint = next.fingerprint;
   if (next.changed === false) return;
-  if (next.sessions) {
-    state = next;
-    if (next.focus_session_id) selectedSid = next.focus_session_id;
-    render();
+  state = next;
+  const explicitFocus = !!(next.focus_session_id || next.focus_dispatch_id);
+  if (explicitFocus) {
+    pinnedTarget = { sessionId: next.focus_session_id, dispatchId: next.focus_dispatch_id };
+    pinResolved = false;
+    runningAtPinRelease = null;
   }
+  const sessions = next.sessions || [];
+  const pinned = findPinnedSession(sessions);
+  let focusedTurn: Turn | undefined;
+  if (pinned && pinnedTarget) {
+    const dispatchId = pinnedTarget.dispatchId;
+    const exact = !dispatchId || matchesDispatch(pinned, dispatchId);
+    if ((explicitFocus || (exact && !pinResolved)) && !matchesSearch(pinned)) {
+      searchQuery = '';
+      const search = document.getElementById('side-search') as HTMLInputElement | null;
+      if (search) search.value = '';
+    }
+    if (exact) pinResolved = true;
+    const targetTurn = findPinnedTurn(pinned, dispatchId);
+    if (targetTurn && ['completed', 'failed', 'aborted'].includes(targetTurn.status)) {
+      selectedSid = pinned.session_id;
+      if (matchesSearch(pinned)) focusedTurn = targetTurn;
+      pinnedTarget = null;
+      runningAtPinRelease = new Set(sessions.filter((s) => s.status === 'running').map(runningKey));
+    }
+  }
+  render(focusedTurn);
 }
 
 async function pollNow(): Promise<void> {
-  if (pollInFlight) return;
-  pollInFlight = true;
+  const epoch = stateEpoch;
+  if (pollInFlight === epoch) return;
+  pollInFlight = epoch;
   try {
+    let data: unknown;
     if (isWebMode) {
       const resp = await fetch('/api/state', { cache: 'no-store' });
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      const data = (await resp.json()) as DashboardState;
-      setLiveBadge(true, '实时同步');
-      applyIncoming(data);
+      data = await resp.json();
     } else if (app) {
       const res = await app.callServerTool({
         name: 'get_codex_state',
-        arguments: { last_fingerprint: lastFingerprint, limit: 15 },
+        arguments: {
+          last_fingerprint: lastFingerprint,
+          limit: 15,
+          session_id: pinnedTarget?.sessionId || (runningAtPinRelease ? selectedSid || '' : ''),
+          dispatch_id: pinnedTarget?.dispatchId || '',
+        },
       });
-      setLiveBadge(true, '实时同步');
-      applyIncoming(res.structuredContent as DashboardState | undefined);
+      if (res.isError) throw new Error('Tool error');
+      data = res.structuredContent;
     }
+    if (epoch !== stateEpoch) return;
+    if (!isDashboardState(data)) throw new Error('Invalid dashboard state');
+    applyIncoming(data);
+    setLiveBadge(true, '实时同步');
   } catch {
-    setLiveBadge(false, '重连中');
+    if (epoch === stateEpoch) setLiveBadge(false, '重连中');
   } finally {
-    pollInFlight = false;
+    if (pollInFlight === epoch) pollInFlight = null;
   }
 }
 
@@ -759,6 +855,8 @@ function wireControls(): void {
   if (followBtn) {
     syncFollowUi();
     followBtn.onclick = () => {
+      pinnedTarget = null;
+      runningAtPinRelease = null;
       autoFollow = !autoFollow;
       syncFollowUi();
       render();
@@ -766,10 +864,7 @@ function wireControls(): void {
   }
   const sessSel = document.getElementById('sess-select') as HTMLSelectElement | null;
   if (sessSel) {
-    sessSel.onchange = () => {
-      selectedSid = sessSel.value || null;
-      render();
-    };
+    sessSel.onchange = () => selectSession(sessSel.value || null);
   }
   const searchEl = document.getElementById('side-search') as HTMLInputElement | null;
   if (searchEl) {
@@ -807,34 +902,23 @@ if (app) {
     setLiveBadge(true, '同步中');
   };
   app.ontoolresult = (result) => {
+    stateEpoch += 1;
+    if (result.isError || !isDashboardState(result.structuredContent) || result.structuredContent.changed === false) {
+      setLiveBadge(false, '重连中');
+      return;
+    }
     autoFollow = true;
+    pinnedTarget = null;
+    runningAtPinRelease = null;
+    lastSessionTurnKey = '';
     lastRunningJumpKey = '';
     syncFollowUi();
-    applyIncoming(result.structuredContent as DashboardState | undefined);
+    applyIncoming(result.structuredContent);
     setLiveBadge(true, '实时同步');
   };
   app.onhostcontextchanged = (ctx) => {
     if (ctx.theme && !userPinnedTheme) applyTheme(ctx.theme);
   };
-}
-
-function startWebSSE(): void {
-  if (!window.EventSource || location.protocol === 'file:') {
-    setInterval(() => void pollNow(), 800);
-    return;
-  }
-  const es = new EventSource('/api/events');
-  es.onopen = () => setLiveBadge(true, '实时同步');
-  es.onmessage = (ev) => {
-    try {
-      const data = JSON.parse(ev.data) as DashboardState;
-      setLiveBadge(true, '实时同步');
-      applyIncoming(data);
-    } catch {
-      // Ignore malformed chunk
-    }
-  };
-  es.onerror = () => setLiveBadge(false, '重连中');
 }
 
 async function boot(): Promise<void> {
