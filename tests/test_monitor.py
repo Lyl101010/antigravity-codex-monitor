@@ -325,7 +325,7 @@ if os.environ.get("TEST_REQUIRE_LIVE") == "1":
     else:
         sys.exit(91)
 pathlib.Path(os.environ["TEST_RESULT"]).write_text(json.dumps({
-    "args":sys.argv[1:], "prompt_size":len(prompt.rstrip("\\r\\n")),
+    "args":sys.argv[1:], "prompt_size":len(prompt.lstrip("\\ufeff").rstrip("\\r\\n")),
     "metadata":[key for key in os.environ if key.startswith("MONITOR_")],
 }), encoding="utf-8")
 sys.exit(int(os.environ.get("TEST_EXIT", "0")))
