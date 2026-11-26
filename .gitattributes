@@ -2,4 +2,5 @@
 *.sh text eol=lf
 *.ps1 text eol=crlf
 *.png binary
-plugin/ui/app.html linguist-generated=true linguist-vendored=true
+plugin/ui/** linguist-generated=true linguist-vendored=true linguist-detectable=false
+*.html linguist-detectable=false
