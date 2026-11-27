@@ -8,7 +8,7 @@
 [![Zero Patch](https://img.shields.io/badge/Zero%20CDP%20%2F%20No%20ASAR-2E7D5B.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-面向 **Google Antigravity** 的原生 **MCP App** 实时协作监控面板与 `codex-worker` 派单套件。
+面向 **Google Antigravity** 的原生 **MCP Server / MCP App**（Model Context Protocol）实时协作监控面板与 `codex-worker` 派单套件。
 
 当你让 Antigravity（Gemini）统筹规划并把编码、重构、写脚本、补单测等任务派发给本地官方 **OpenAI Codex CLI（`codex exec`）** 执行时，以往 `codex exec` 只能在后台黑盒运行、看不到中间过程。装上本插件后，Antigravity 右侧辅助栏会自动弹出 **Codex Monitor**，以 **0.8 秒** 实时流式展示每一次派单的执行命令、语法高亮文件 Diff、模型档位、Token 与缓存命中统计——**纯本地只读轮询，零额外 LLM 消耗，零 CDP 侵入，客户端升级不失效**。
 
