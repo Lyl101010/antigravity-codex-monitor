@@ -2,7 +2,7 @@
 
 [简体中文](./README.md) · **English**
 
-[![Version](https://img.shields.io/badge/version-1.0.1-3D6470.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
+[![Version](https://img.shields.io/badge/version-1.1.0-3D6470.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Antigravity](https://img.shields.io/badge/Antigravity-2.x%20MCP%20App-C96442.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-4B5563.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -29,7 +29,8 @@ When Antigravity (Gemini) delegates scoped coding, refactoring, scripting, or un
 - **Live visibility for `codex exec`**: Streams active commands, exit codes, syntax-colored file diffs, and token/cache metrics every 0.8s at zero model cost.
 - **Native MCP App (Zero Patch)**: Uses Antigravity's official plugin & MCP Apps (SEP-1865) API—no `.asar` edits, no CDP injection, no breakage on updates.
 - **Cross-platform & self-contained**: Ships Windows (`run-codex.ps1`), macOS/Linux (`run-codex.sh`), a bundled `codex-worker` skill, and a prebuilt single-file HTML UI (**no Node.js required for end users**).
-- **Safe guardrails**: Automatic Git `--worktree` isolation for write tasks, locked `read-only` / `workspace-write` sandbox, 2-round retry cap, and strict single-direction delegation (`Antigravity -> official codex exec` only; never invokes `agy` in reverse and never reads OAuth credentials).
+- **Dispatch from any chat**. Omit the target path to create a fresh task directory under `~/.gemini/antigravity/scratch/codex-tasks/`. Set `ANTIGRAVITY_SCRATCH_DIR` to override the scratch root.
+- **Safe defaults**. Read-only and write tasks default to `read-only` and `workspace-write`, respectively. Trusted write tasks can opt into `-Sandbox full-access` / `--sandbox full-access`. Git write tasks default to `--worktree` isolation. Delegation has a two-round cap and requires user confirmation before merges or pushes.
 
 ---
 
@@ -69,7 +70,7 @@ python3 install.py uninstall
 
 - **Single-direction only**: `Antigravity -> official codex exec`. No reverse calls to personal Antigravity CLI (`agy`).
 - **Zero credential access**: Never reads, exports, or proxies `~/.codex/auth.json`, OAuth tokens, or cookies.
-- **100% local & zero telemetry**: Reads local Codex dispatch/session logs only; no external network calls.
+- **Local monitoring**. The monitor reads local Codex dispatch and session logs and sends no telemetry.
 
 ## License
 

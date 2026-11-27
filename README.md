@@ -2,7 +2,7 @@
 
 **简体中文** · [English](./README.en.md)
 
-[![Version](https://img.shields.io/badge/version-1.0.1-3D6470.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
+[![Version](https://img.shields.io/badge/version-1.1.0-3D6470.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Antigravity](https://img.shields.io/badge/Antigravity-2.x%20MCP%20App-C96442.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-4B5563.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Zero Patch](https://img.shields.io/badge/Zero%20CDP%20%2F%20No%20ASAR-2E7D5B.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
@@ -33,7 +33,8 @@
 - **告别 `codex exec` 黑盒**：派单瞬间自动弹出右侧栏面板，每 0.8s 实时流式呈现 Codex 正在执行的命令、退出码、语法高亮 Diff、推理模型与 Token / 缓存命中率，纯本地状态指纹轮询，**不消耗任何模型额度**。
 - **原生 MCP App，不惧客户端更新**：严格遵循 Antigravity 官方插件与 MCP Apps（SEP-1865）规范，**不修改 `.asar`、不依赖 CDP 注入、不破坏客户端签名**，官方更新后依然稳定可用。
 - **一个插件，开箱即用**：内置侧栏监控面板 + 跨平台派单脚本（Windows `run-codex.ps1` / macOS & Linux `run-codex.sh`）+ 内嵌 `codex-worker` Skill，前端已预编译为单文件 HTML，**最终用户安装无需 Node.js**。
-- **工程级安全护栏**：Git 仓库写任务默认启用 `--worktree` 隔离，沙箱强锁 `read-only` / `workspace-write`（禁用 `danger-full-access`），支持按 `SESSION_ID` 续跑与 2 轮封顶防死循环，合并与推送始终由用户确认。
+- **无工作区也能派单**。省略目标路径时，启动器会在 `~/.gemini/antigravity/scratch/codex-tasks/` 下创建独立任务目录。可用 `ANTIGRAVITY_SCRATCH_DIR` 自定义 scratch 根目录。
+- **默认隔离**。只读和写任务的默认沙箱分别为 `read-only` 和 `workspace-write`。可信写任务可显式指定 `-Sandbox full-access` / `--sandbox full-access`。Git 写任务默认使用 `--worktree`，支持按 `SESSION_ID` 续跑，最多两轮，合并与推送须由用户确认。
 - **为什么用 `codex exec + Monitor` 而不是 `codex mcp-server`？**
 
 | 对比维度 | `antigravity-codex-monitor` (`codex exec`) | `codex mcp-server` |

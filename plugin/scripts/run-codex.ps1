@@ -1,12 +1,15 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory=$true)][string]$TargetPath,
+    [string]$TargetPath='',
     [ValidateSet('read-only','write')][string]$Mode='write',
     [ValidateSet('low','medium','high','xhigh')][string]$Effort='medium',
     [string]$Model='', [string]$Prompt='', [string]$PromptFile='',
-    [string]$ResumeSessionId='', [switch]$InPlace, [string]$DispatchId=''
+    [string]$ResumeSessionId='', [switch]$InPlace, [string]$DispatchId='',
+    [ValidateSet('','read-only','workspace-write','full-access',IgnoreCase=$false)][string]$Sandbox=''
 )
 $ErrorActionPreference = 'Stop'
+if (-not $Sandbox) { $Sandbox = if ($Mode -eq 'write') { 'workspace-write' } else { 'read-only' } }
+if ($Mode -eq 'read-only' -and $Sandbox -ne 'read-only') { throw 'Read-only mode requires the read-only sandbox' }
 if ($PSBoundParameters.ContainsKey('DispatchId')) {
     if (-not $DispatchId -or $DispatchId -match '[\s\p{Cc}]' -or
         ($DispatchId -replace '[\uD800-\uDBFF][\uDC00-\uDFFF]', '_').Length -gt 128) {
@@ -22,13 +25,51 @@ if (-not $codex) {
     }
 }
 if (-not $codex) { throw 'codex not found on PATH' }
-$target = (Resolve-Path -LiteralPath $TargetPath).Path
-if (-not (Test-Path -LiteralPath $target -PathType Container)) { throw 'TargetPath must be a directory' }
 if ($PromptFile) { $Prompt = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $PromptFile).Path, [Text.Encoding]::UTF8) }
 if (-not $Prompt.Trim()) { throw 'Provide -Prompt or -PromptFile' }
+
+function Resolve-ScratchPath([string]$Path, [int]$LinkDepth=0) {
+    $parent = [IO.Path]::GetDirectoryName($Path)
+    if (-not $parent) { return $Path }
+    $parent = Resolve-ScratchPath $parent $LinkDepth
+    $Path = [IO.Path]::Combine($parent, [IO.Path]::GetFileName($Path))
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        $link = @($item.Target)[0]
+        if (-not $link -or $LinkDepth -ge 40) { throw 'TargetPath must be a directory' }
+        $linkPath = [IO.Path]::GetFullPath([IO.Path]::Combine($parent, $link))
+        return (Resolve-ScratchPath $linkPath ($LinkDepth + 1))
+    }
+    return $Path
+}
+
+$userHome = if ($HOME) { $HOME } else { $env:USERPROFILE }
+$scratchTask = -not $TargetPath
+if ($scratchTask -or -not (Test-Path -LiteralPath $TargetPath)) {
+    $scratchRoot = if ($env:ANTIGRAVITY_SCRATCH_DIR) { $env:ANTIGRAVITY_SCRATCH_DIR } else { Join-Path $userHome '.gemini/antigravity/scratch' }
+    $scratchRoot = Resolve-ScratchPath ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($scratchRoot))
+    if ($scratchTask) { $TargetPath = Join-Path $scratchRoot 'codex-tasks' }
+    $target = Resolve-ScratchPath ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TargetPath))
+    $separator = [IO.Path]::DirectorySeparatorChar
+    $comparison = if ($separator -eq '\') { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    $scratchPrefix = $scratchRoot.TrimEnd($separator) + $separator
+    if (-not ($target.TrimEnd($separator) + $separator).StartsWith($scratchPrefix, $comparison)) {
+        throw 'TargetPath must be a directory'
+    }
+    [IO.Directory]::CreateDirectory($target) | Out-Null
+    if ($scratchTask) {
+        $stamp = [DateTime]::Now.ToString('yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture)
+        $suffix = [guid]::NewGuid().ToString('N').Substring(0,8)
+        $parent = [System.Management.Automation.WildcardPattern]::Escape($target)
+        $target = (New-Item -ItemType Directory -Path $parent -Name "task-$stamp-$suffix").FullName
+    }
+} else {
+    $target = (Resolve-Path -LiteralPath $TargetPath).Path
+    if (-not (Test-Path -LiteralPath $target -PathType Container)) { throw 'TargetPath must be a directory' }
+}
 $root = $null
 $isGit = $false
-if (Get-Command git -ErrorAction SilentlyContinue) {
+if (-not $scratchTask -and (Get-Command git -ErrorAction SilentlyContinue)) {
     $old = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
@@ -37,7 +78,6 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
     } finally { $ErrorActionPreference = $old }
 }
 if ($isGit) { $target = $root.Trim() }
-$sandbox = if ($Mode -eq 'write') { 'workspace-write' } else { 'read-only' }
 $config = 'model_reasoning_effort="{0}"' -f $Effort
 if ($PSVersionTable.PSVersion -lt [version]'7.3' -or $PSNativeCommandArgumentPassing -eq 'Legacy' -or
     ($PSNativeCommandArgumentPassing -eq 'Windows' -and $codex.Source -match '\.(cmd|bat|ps1)$')) {
@@ -45,16 +85,18 @@ if ($PSVersionTable.PSVersion -lt [version]'7.3' -or $PSNativeCommandArgumentPas
 }
 $arguments = @('exec')
 if (-not $ResumeSessionId) { $arguments += @('-C',$target) }
-$arguments += @('-s',$sandbox,'-c',$config)
+if ($Sandbox -eq 'full-access') { $arguments += '--dangerously-bypass-approvals-and-sandbox' }
+else { $arguments += @('-s',$Sandbox) }
+$arguments += @('-c',$config)
 if (-not $isGit) { $arguments += '--skip-git-repo-check' }
 if (-not $ResumeSessionId -and $isGit -and $Mode -eq 'write' -and -not $InPlace) { $arguments += '--worktree' }
 if ($Model) { $arguments += @('-m',$Model) }
 if ($ResumeSessionId) { $arguments += @('resume',$ResumeSessionId) }
 $arguments += @('--json','-')
-$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $userHome '.codex' }
 [IO.Directory]::CreateDirectory($codexHome) | Out-Null
 $logPath = Join-Path $codexHome 'codex-worker-dispatches.json'
-$entry = @{dispatch_id=$DispatchId; direction='ag_to_codex'; session_id=$ResumeSessionId; target_root=$target; mode=$Mode; model=$Model; effort=$Effort; started_at=[DateTime]::UtcNow.ToString('o'); prompt_preview=$Prompt.Substring(0,[Math]::Min(4000,$Prompt.Length)); status='running'}
+$entry = @{dispatch_id=$DispatchId; direction='ag_to_codex'; session_id=$ResumeSessionId; target_root=$target; mode=$Mode; sandbox=$Sandbox; model=$Model; effort=$Effort; started_at=[DateTime]::UtcNow.ToString('o'); prompt_preview=$Prompt.Substring(0,[Math]::Min(4000,$Prompt.Length)); status='running'}
 function Update-Dispatch {
     $lockPath = "$logPath.lock"
     $deadline = [DateTime]::UtcNow.AddSeconds(10)

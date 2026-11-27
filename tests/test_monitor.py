@@ -453,9 +453,10 @@ class MonitorTests(unittest.TestCase):
 
     def test_static_and_shell_syntax(self):
         manifest = json.loads((ROOT/'plugin/plugin.json').read_text(encoding='utf-8'))
-        self.assertEqual(manifest['version'],'1.0.1')
+        self.assertEqual(manifest['version'],'1.1.0')
         ps = (ROOT/'plugin/scripts/run-codex.ps1').read_text(encoding='utf-8')
-        sh = (ROOT/'plugin/scripts/run-codex.sh').read_text(encoding='utf-8')
+        sh = (ROOT/'plugin/scripts/run-codex.sh').read_bytes().decode('utf-8')
+        self.assertNotIn('\r', sh)
         self.assertNotRegex(ps, r'File\]::Replace\([^\n]*,\s*\$null\s*\)')
         self.assertRegex(ps, r'File\]::Replace\([^\n]*,\s*\[NullString\]::Value\)')
         self.assertRegex(ps, r'if \(-not \$ResumeSessionId[^)\n]*\)[^\n]*--worktree')
@@ -527,7 +528,8 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
         actual_args = captured['args']
         if '-C' in expected_args:
             self.assertEqual(actual_args[:2], expected_args[:2])
-            self.assertEqual(Path(actual_args[2]).resolve(), Path(expected_args[2]).resolve())
+            if expected_args[2] is not None:
+                self.assertEqual(Path(actual_args[2]).resolve(), Path(expected_args[2]).resolve())
             actual_args, expected_args = actual_args[3:], expected_args[3:]
         self.assertEqual(actual_args, expected_args)
         self.assertEqual(captured['prompt_size'], 140_000)
@@ -540,6 +542,64 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
         else:
             self.assertEqual(uuid.UUID(ids[0]).version, 4)
         return ids[0]
+
+    def check_scratch_and_sandbox_launches(self, command, result, env, flags, target_error):
+        target_flag, mode_flag, sandbox_flag = flags
+        scratch = self.path/'scratch [dir]'
+        decoy = self.path/'scratch d'/'codex-tasks'
+        decoy.mkdir(parents=True)
+        env = dict(env, ANTIGRAVITY_SCRATCH_DIR=str(scratch), TEST_EXIT='0')
+        log = self.dashboard.DISPATCH_LOG
+        config = ['-c', 'model_reasoning_effort="medium"', '--skip-git-repo-check', '--json', '-']
+
+        def launch(extra_args, expected_target, sandbox, sandbox_args, launch_env):
+            dispatch_id = self.check_launcher(command + extra_args, result, launch_env,
+                                              ['exec', '-C', expected_target, *sandbox_args, *config])
+            entry = json.loads(log.read_bytes())[-1]
+            self.assertEqual(entry['dispatch_id'], dispatch_id)
+            self.assertEqual(entry['sandbox'], sandbox)
+            target = Path(entry['target_root']).resolve()
+            self.assertTrue(target.is_dir(), entry['target_root'])
+            args = json.loads(result.read_bytes())['args']
+            self.assertEqual(Path(args[2]).resolve(), target)
+            return target
+
+        generated = []
+        for extra_args in ([], [target_flag, '', sandbox_flag, '']):
+            with self.subTest(extra_args=extra_args):
+                target = launch(extra_args, None, 'workspace-write', ['-s', 'workspace-write'], env)
+                self.assertEqual(target.parent, (scratch/'codex-tasks').resolve())
+                self.assertRegex(target.name, r'^task-\d{8}-\d{6}-[0-9a-f]{8}$')
+                generated.append(target)
+        self.assertEqual(len(set(generated)), 2)
+        self.assertEqual(list(decoy.iterdir()), [])
+
+        env['TEST_GIT_ROOT'] = ''
+        child = scratch/'new'/'nested'
+        self.assertFalse(child.exists())
+        launch([target_flag, child.as_posix(), sandbox_flag, 'full-access'], child, 'full-access',
+               ['--dangerously-bypass-approvals-and-sandbox'], env)
+        exact = self.path/'new scratch root'
+        launch([target_flag, exact.as_posix(), mode_flag, 'read-only'], exact, 'read-only',
+               ['-s', 'read-only'], dict(env, ANTIGRAVITY_SCRATCH_DIR=str(exact)))
+
+        sibling = scratch.with_name(scratch.name + '2')/'sub'
+        failures = [
+            ([target_flag, sibling.as_posix()], target_error),
+            ([target_flag, child.as_posix(), mode_flag, 'read-only', sandbox_flag, 'full-access'], 'read-only'),
+            ([target_flag, child.as_posix(), mode_flag, 'read-only', sandbox_flag, 'workspace-write'], 'read-only'),
+            ([sandbox_flag, 'unknown'], 'sandbox'),
+            ([sandbox_flag, 'FULL-ACCESS'], 'sandbox'),
+        ]
+        before = log.read_bytes()
+        for extra_args, error in failures:
+            with self.subTest(extra_args=extra_args):
+                completed = subprocess.run(command + extra_args, capture_output=True, env=env, cwd=ROOT,
+                                           timeout=20, encoding='utf-8', errors='replace')
+                self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertIn(error, completed.stderr.lower())
+        self.assertFalse(sibling.parent.exists())
+        self.assertEqual(log.read_bytes(), before)
 
     def check_dispatch_log_concurrency(self, command, flag, env):
         def invoke(extra_args, **overrides):
@@ -585,7 +645,7 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
         scripts = {
             'python3':'exec "$TEST_PYTHON" "$@"',
             'codex':'exec "$TEST_PYTHON" "$TEST_STUB" "$@"',
-            'git':'[[ -d "$2" ]] || exit 128\nprintf "%s\\n" "$TEST_GIT_ROOT"',
+            'git':'[[ -d "$2" && -n "$TEST_GIT_ROOT" ]] || exit 128\nprintf "%s\\n" "$TEST_GIT_ROOT"',
         }
         for name, script in scripts.items():
             path = bin_dir/name
@@ -594,11 +654,11 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
         env['TMPDIR'] = self.path.name
         env['CODEX_HOME'] = self.path.name
         env['TEST_REQUIRE_LIVE'] = '1'
-        command = [shutil.which('bash'), '-c',
-                   'export PATH="$(CDPATH= cd "$TEST_BIN" && pwd -P):$PATH" CDPATH=.; '
-                   'exec bash plugin/scripts/run-codex.sh "$@"',
-                   'launcher', '--target-path', target.relative_to(ROOT).as_posix(), '--prompt-file', prompt.as_posix(),
-                   '--model', 'test-model']
+        launcher = [shutil.which('bash'), '-c',
+                    'export PATH="$(CDPATH= cd "$TEST_BIN" && pwd -P):$PATH" CDPATH=.; '
+                    'exec bash plugin/scripts/run-codex.sh "$@"',
+                    'launcher', '--prompt-file', prompt.as_posix()]
+        command = launcher + ['--target-path', target.relative_to(ROOT).as_posix(), '--model', 'test-model']
         options = ['-s', 'workspace-write', '-c', 'model_reasoning_effort="medium"']
         generated = self.check_launcher(command, result, env,
                                         ['exec', '-C', str(target), *options, '--worktree', '-m', 'test-model', '--json', '-'])
@@ -610,6 +670,8 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
         self.assertEqual([d['session_id'] for d in records], ['test-session', 'test-session'])
         self.assertEqual(records[-1]['prompt_preview'], 'p' * 4000)
         self.check_dispatch_log_concurrency(command[:-2], '--dispatch-id', env)
+        self.check_scratch_and_sandbox_launches(launcher, result, env,
+                                               ('--target-path', '--mode', '--sandbox'), 'target directory is required')
 
     @unittest.skipUnless(os.name == 'nt' and shutil.which('powershell'), 'Windows PowerShell is unavailable')
     def test_windows_powershell_launch_and_live_dispatch(self):
@@ -623,9 +685,9 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
         env['TEST_REQUIRE_LIVE'] = '1'
         log = self.dashboard.DISPATCH_LOG
         log.write_text(json.dumps([{'dispatch_id':str(i)} for i in range(200)]), encoding='utf-8')
-        command = [shutil.which('powershell'), '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-                   str(ROOT/'plugin/scripts/run-codex.ps1'), '-TargetPath', str(target), '-PromptFile', str(prompt),
-                   '-Model', 'test-model']
+        launcher = [shutil.which('powershell'), '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                    str(ROOT/'plugin/scripts/run-codex.ps1'), '-PromptFile', str(prompt)]
+        command = launcher + ['-TargetPath', str(target), '-Model', 'test-model']
         options = ['-s', 'workspace-write', '-c', 'model_reasoning_effort="medium"']
         self.check_launcher(command, result, env,
                             ['exec', '-C', str(target), *options, '--worktree', '-m', 'test-model', '--json', '-'])
@@ -644,6 +706,8 @@ sys.exit(int(os.environ.get("TEST_EXIT", "0")))
         self.assertEqual(entries[-1]['status'], 'failed')
         self.assertEqual(entries[-1]['exit_code'], 9)
         self.check_dispatch_log_concurrency(command[:-2], '-DispatchId', env)
+        self.check_scratch_and_sandbox_launches(launcher, result, dict(env, TEST_GIT_ROOT=target.as_posix()),
+                                               ('-TargetPath', '-Mode', '-Sandbox'), 'targetpath must be a directory')
 
     @unittest.skipUnless(shutil.which('node'), 'Node.js is unavailable')
     def test_rich_text_blank_bullets_and_turn_badges(self):

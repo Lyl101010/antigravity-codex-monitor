@@ -1,21 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
-target='' prompt='' prompt_file='' resume='' mode=write effort=medium model='' in_place=0
+target='' prompt='' prompt_file='' resume='' mode=write effort=medium model='' in_place=0 sandbox=''
 dispatch_id='' dispatch_supplied=0
 while (($#)); do
   case "$1" in
-    --target-path) target=${2:?}; shift 2;; --prompt) prompt=${2:?}; shift 2;;
+    --target-path) target=${2?}; shift 2;; --prompt) prompt=${2:?}; shift 2;;
     --prompt-file) prompt_file=${2:?}; shift 2;; --resume) resume=${2:?}; shift 2;;
     --mode) mode=${2:?}; shift 2;; --effort) effort=${2:?}; shift 2;;
     --model) model=${2?}; shift 2;; --in-place) in_place=1; shift;;
+    --sandbox) sandbox=${2?}; shift 2;;
     --dispatch-id) dispatch_id=${2?}; dispatch_supplied=1; shift 2;;
     *) printf 'Unknown argument: %s\n' "$1" >&2; exit 2;;
   esac
 done
 case "$mode" in read-only|write) ;; *) exit 2;; esac
 case "$effort" in low|medium|high|xhigh) ;; *) exit 2;; esac
-[[ -d "$target" ]] || { printf 'Target directory is required\n' >&2; exit 2; }
-target=$(CDPATH= cd "$target" && pwd -P)
+case "$sandbox" in
+  '') if [[ "$mode" == write ]]; then sandbox=workspace-write; else sandbox=read-only; fi;;
+  read-only|workspace-write|full-access) ;;
+  *) printf 'Sandbox must be read-only, workspace-write, or full-access\n' >&2; exit 2;;
+esac
+if [[ "$mode" == read-only && "$sandbox" != read-only ]]; then
+  printf 'Read-only mode requires the read-only sandbox\n' >&2
+  exit 2
+fi
 if [[ -n "$prompt_file" ]]; then prompt=$(cat "$prompt_file"); fi
 [[ -n "$prompt" ]] || { printf 'Prompt is required\n' >&2; exit 2; }
 codex=$(command -v codex || true)
@@ -31,17 +39,44 @@ if not value or len(value) > 128 or any(c.isspace() or unicodedata.category(c) =
 else
   dispatch_id=$("$python" -c 'import uuid; print(uuid.uuid4())')
 fi
+scratch_task=0
+if [[ -z "$target" ]]; then scratch_task=1; fi
+if [[ -d "$target" ]]; then
+  target=$(CDPATH= cd -- "$target" && pwd -P)
+else
+  scratch_root=${ANTIGRAVITY_SCRATCH_DIR:-$HOME/.gemini/antigravity/scratch}
+  target=$("$python" -c '
+from datetime import datetime
+from pathlib import Path
+import sys, uuid
+
+scratch = Path(sys.argv[1]).resolve()
+requested = sys.argv[2]
+target = (Path(requested) if requested else scratch / "codex-tasks").resolve()
+if not target.is_relative_to(scratch):
+    sys.exit("Target directory is required")
+if not requested:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target /= f"task-{stamp}-{uuid.uuid4().hex[:8]}"
+try:
+    target.mkdir(parents=True, exist_ok=bool(requested))
+except (FileExistsError, NotADirectoryError):
+    sys.exit("Target directory is required")
+print(target.as_posix())
+' "$scratch_root" "$target")
+fi
 export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 mkdir -p "$CODEX_HOME"
 started=$("$python" -c 'from datetime import datetime,timezone; print(datetime.now(timezone.utc).isoformat())')
-root=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null || true)
 is_git=0
-if [[ -n "$root" ]]; then is_git=1; target=$root; fi
-sandbox=read-only
-if [[ "$mode" == write ]]; then sandbox=workspace-write; fi
+if (( ! scratch_task )); then
+  root=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null || true)
+  if [[ -n "$root" ]]; then is_git=1; target=$root; fi
+fi
 args=(exec)
 if [[ -z "$resume" ]]; then args+=(-C "$target"); fi
-args+=(-s "$sandbox" -c "model_reasoning_effort=\"$effort\"")
+if [[ "$sandbox" == full-access ]]; then args+=(--dangerously-bypass-approvals-and-sandbox); else args+=(-s "$sandbox"); fi
+args+=(-c "model_reasoning_effort=\"$effort\"")
 if (( ! is_git )); then args+=(--skip-git-repo-check); fi
 if (( is_git && ! in_place )) && [[ "$mode" == write && -z "$resume" ]]; then args+=(--worktree); fi
 if [[ -n "$model" ]]; then args+=(-m "$model"); fi
@@ -49,7 +84,7 @@ if [[ -n "$resume" ]]; then args+=(resume "$resume"); fi
 args+=(--json -)
 session=$resume
 update() {
-  printf '%s\n%s' "$dispatch_id" "$prompt" | MONITOR_TARGET="$target" MONITOR_MODE="$mode" \
+  printf '%s\n%s' "$dispatch_id" "$prompt" | MONITOR_TARGET="$target" MONITOR_MODE="$mode" MONITOR_SANDBOX="$sandbox" \
     MONITOR_MODEL="$model" MONITOR_EFFORT="$effort" MONITOR_STARTED="$started" MONITOR_SESSION="$session" \
     MONITOR_STATUS="$1" MONITOR_EXIT="${2:-}" "$python" -c '
 import json, os, pathlib, sys, tempfile, time
@@ -59,6 +94,7 @@ dispatch_id = sys.stdin.buffer.readline().decode("utf-8").rstrip("\n")
 preview = sys.stdin.buffer.read().decode("utf-8", errors="replace")[:4000]
 entry = dict(dispatch_id=dispatch_id, direction="ag_to_codex", session_id=e["MONITOR_SESSION"],
              target_root=e["MONITOR_TARGET"], mode=e["MONITOR_MODE"], model=e["MONITOR_MODEL"],
+             sandbox=e["MONITOR_SANDBOX"],
              effort=e["MONITOR_EFFORT"], started_at=e["MONITOR_STARTED"], prompt_preview=preview,
              status=e["MONITOR_STATUS"], exit_code=e["MONITOR_EXIT"])
 lock = p.with_suffix(".json.lock")

@@ -21,7 +21,7 @@ Whenever you dispatch a task to Codex (Round 1 or Round 2):
 
 ## Guardrails
 
-1. **Single-direction & sandbox-locked**: Strictly `Antigravity -> official codex exec` only. Sandbox is locked to `read-only` or `workspace-write` (never `danger-full-access`).
+1. **Single-direction delegation and safe defaults**. All dispatches go from Antigravity to the official `codex exec` CLI. Reviews in `read-only` mode use the `read-only` sandbox. Write tasks default to `workspace-write`. For trusted write tasks that require network or unrestricted local tool access, use `-Sandbox full-access` / `--sandbox full-access` only when the user explicitly opts in. Read-only mode requires the `read-only` sandbox.
 2. **Git worktree isolation**: For Git repositories, `write` tasks run inside an isolated `--worktree` by default so the main working tree stays untouched (pass `-InPlace` / `--in-place` only when explicitly requested). Non-Git folders automatically use `--skip-git-repo-check`.
 3. **Effort tiers**:
    - `low`: strictly mechanical, zero-ambiguity edits.
@@ -35,9 +35,15 @@ Whenever you dispatch a task to Codex (Round 1 or Round 2):
 
 Write your scoped task prompt to a temporary file first to avoid shell quoting issues, then invoke the platform script:
 
+In a no-workspace chat, omit `-TargetPath` / `--target-path`. Each dispatch gets a fresh working directory under `~/.gemini/antigravity/scratch/codex-tasks/` by default. Set `ANTIGRAVITY_SCRATCH_DIR` to use a different scratch root. For a follow-up, pass the original `WORKDIR` as the target along with the `SESSION_ID`.
+
 ### Windows (PowerShell)
 
 ```powershell
+# No-workspace write task
+powershell -ExecutionPolicy Bypass -File "$HOME\.gemini\config\plugins\antigravity-codex-monitor\scripts\run-codex.ps1" `
+  -DispatchId "<DISPATCH_ID>" -PromptFile "<TEMP_PROMPT_FILE>"
+
 # Write task (Git worktree automatically)
 powershell -ExecutionPolicy Bypass -File "$HOME\.gemini\config\plugins\antigravity-codex-monitor\scripts\run-codex.ps1" `
   -TargetPath "<PROJECT_OR_REPO_ROOT>" `
@@ -67,6 +73,10 @@ powershell -ExecutionPolicy Bypass -File "$HOME\.gemini\config\plugins\antigravi
 ### macOS / Linux (Bash)
 
 ```bash
+# No-workspace write task
+~/.gemini/config/plugins/antigravity-codex-monitor/scripts/run-codex.sh \
+  --dispatch-id "<DISPATCH_ID>" --prompt-file "<TEMP_PROMPT_FILE>"
+
 # Write task (Git worktree automatically)
 ~/.gemini/config/plugins/antigravity-codex-monitor/scripts/run-codex.sh \
   --target-path "<PROJECT_OR_REPO_ROOT>" \
