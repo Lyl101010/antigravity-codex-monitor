@@ -2,7 +2,7 @@
 
 **简体中文** · [English](./README.en.md)
 
-[![Version](https://img.shields.io/badge/version-1.1.0-3D6470.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
+[![Version](https://img.shields.io/badge/version-1.1.1-3D6470.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Antigravity](https://img.shields.io/badge/Antigravity-2.x%20MCP%20App-C96442.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-4B5563.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Zero Patch](https://img.shields.io/badge/Zero%20CDP%20%2F%20No%20ASAR-2E7D5B.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
@@ -55,7 +55,7 @@
 ### 环境要求
 - **Google Antigravity 2.x** 桌面端
 - **OpenAI Codex CLI**（官方版，已完成 `codex login`）
-- **Python 3.10+** 且已安装 `mcp` 包（`pip install mcp`）
+- **Python 3.10+** 且已安装 `mcp` 包（`pip install mcp`），支持 1.x 和 2.x
 
 ### 方式一：复制引导词发给你的 AI Agent 一键安装（推荐）
 
@@ -96,7 +96,7 @@ python install.py uninstall
 ```mermaid
 flowchart LR
   User["用户"] --> AG["Antigravity (架构规划 / 审阅 / 验收)"]
-  AG -- "1. 并行打开侧栏 (MCP App)" --> Server["plugin/server.py (FastMCP)"]
+  AG -- "1. 并行打开侧栏 (MCP App)" --> Server["plugin/server.py (MCP)"]
   AG -- "2. 派发工单 (run-codex.ps1 / .sh)" --> Codex["官方 codex exec (worktree / 沙箱隔离)"]
   Codex -- "写入本地状态与 JSONL 轨迹" --> Logs["~/.codex/sessions & dispatches.json"]
   Server -- "0.8s 纯本地只读指纹轮询" --> Logs
@@ -113,7 +113,7 @@ antigravity-codex-monitor/
 ├── INSTALL_SKILL.md                 # AI Agent 自动部署契约
 ├── plugin/                          # 自包含 Antigravity 原生插件包
 │   ├── plugin.json                  # 插件清单与快捷提示
-│   ├── server.py                    # FastMCP 服务端 (open_codex_monitor / get_codex_state)
+│   ├── server.py                    # MCP 服务端 (open_codex_monitor / get_codex_state)
 │   ├── dashboard_server.py          # 纯标准库本地会话解析与指纹引擎
 │   ├── assets/logo.svg              # 原创 SVG 图标
 │   ├── ui/app.html                  # 预编译单文件前端 (安装无需 Node.js)

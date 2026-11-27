@@ -18,7 +18,7 @@ python install.py doctor --json
 ```
 
 重点检查输出字段：
-1. `python`：是否自动找到了已安装 `mcp`（`mcp.server.fastmcp`）的 Python 解释器。
+1. `python`：探测可用的 Python 解释器及 `mcp` 版本，支持 `mcp` 1.x（`FastMCP`）和 2.x（`MCPServer`）。
    - 若为 `null`：引导用户在目标 Python 环境中执行 `pip install mcp`（或指定已装好 `mcp` 的解释器路径 `--python "<path>"`），不要强行写入不可用的解释器。
 2. `codex`：是否检测到本机官方 `codex` CLI。
    - 若为 `null`：提示用户先安装官方 OpenAI Codex CLI 并完成登录（`codex login`）。

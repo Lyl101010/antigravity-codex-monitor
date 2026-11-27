@@ -34,7 +34,23 @@ def python_candidates():
 
 
 def discover_python(explicit=None):
-    probe = 'import sys,importlib.metadata; import mcp.server.fastmcp; print(sys.executable); print(importlib.metadata.version("mcp"))'
+    probe = '''
+import importlib.metadata
+import sys
+
+from mcp.types import CallToolResult, TextContent
+
+try:
+    from mcp.server import MCPServer
+except ImportError:
+    try:
+        from mcp.server.mcpserver import MCPServer
+    except ImportError:
+        from mcp.server.fastmcp import FastMCP as MCPServer
+
+print(sys.executable)
+print(importlib.metadata.version("mcp"))
+'''
     for cmd in ([[explicit]] if explicit is not None else python_candidates()):
         try:
             p = run_checked(cmd + ['-c', probe])

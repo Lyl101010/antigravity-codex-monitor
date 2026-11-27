@@ -1,6 +1,7 @@
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 import importlib.util
 from http.client import HTTPConnection
+import io
 import json
 import os
 from pathlib import Path
@@ -238,23 +239,91 @@ class MonitorTests(unittest.TestCase):
         with patch.object(d.os, 'name', 'posix'):
             self.assertNotEqual(d.path_key('A/B'),d.path_key('a/b'))
 
-    def server_modules(self, calls=None):
+    def server_modules(self, calls=None, *, sdk='fastmcp'):
         class FastMCP:
-            def __init__(self,*a,**k): pass
-            def tool(self,*a,**k): return lambda f:f
-            def resource(self,*a,**k): return lambda f:f
+            def __init__(self, name):
+                self.name = name
+                self.tools = {}
+                self.resources = {}
+
+            def tool(self, *, name, title, description, meta):
+                self.tools[name] = (title, description, meta)
+                return lambda handler: handler
+
+            def resource(self, uri, *, name, mime_type, meta):
+                self.resources[uri] = (name, mime_type, meta)
+                return lambda handler: handler
+
             def run(self):
                 if calls is not None:
                     calls.append('mcp')
-        modules = {'dashboard_server':self.dashboard,'mcp':types.ModuleType('mcp'),'mcp.server':types.ModuleType('mcp.server'),'mcp.server.fastmcp':types.ModuleType('mcp.server.fastmcp'),'mcp.types':types.ModuleType('mcp.types')}
+
+        class MCPServer(FastMCP):
+            pass
+
+        class V2CallToolResult:
+            def __init__(self, *, content, structuredContent, isError=False):
+                self.content = content
+                self.structured_content = structuredContent
+                self.is_error = isError
+
+        modules = {name: types.ModuleType(name) for name in (
+            'mcp', 'mcp.server', 'mcp.server.fastmcp', 'mcp.server.mcpserver', 'mcp.types',
+        )}
+        modules['dashboard_server'] = self.dashboard
         modules['mcp.server.fastmcp'].FastMCP = FastMCP
         modules['mcp.types'].CallToolResult = types.SimpleNamespace
         modules['mcp.types'].TextContent = types.SimpleNamespace
+        if sdk != 'fastmcp':
+            modules[sdk].MCPServer = MCPServer
+            modules['mcp.types'].CallToolResult = V2CallToolResult
         return modules
 
     def load_server(self):
         with patch.dict(sys.modules, self.server_modules()):
             return load('monitor_server', ROOT/'plugin/server.py')
+
+    def test_sdk_server_loading_and_metadata(self):
+        app_uri = 'ui://antigravity-codex-monitor/app.html'
+        for sdk in ('fastmcp', 'mcp.server', 'mcp.server.mcpserver'):
+            with self.subTest(sdk=sdk), patch.dict(sys.modules, self.server_modules(sdk=sdk)):
+                server = load('monitor_server', ROOT/'plugin/server.py')
+                implementation = (sys.modules['mcp.server.fastmcp'].FastMCP if sdk == 'fastmcp'
+                                  else sys.modules[sdk].MCPServer)
+                self.assertIs(type(server.mcp), implementation)
+                self.assertEqual(server.mcp.name, 'antigravity-codex-monitor')
+                title, description, meta = server.mcp.tools['open_codex_monitor']
+                self.assertEqual(title, 'antigravity-codex-monitor')
+                self.assertTrue(description)
+                self.assertEqual(meta, {
+                    'ui': {'resourceUri': app_uri},
+                    'com.google.antigravity/ui': {'entrypoints': [
+                        {'type': 'aux_pane', 'title': 'antigravity-codex-monitor'},
+                        {'type': 'global', 'title': 'antigravity-codex-monitor'},
+                    ]},
+                })
+                title, description, meta = server.mcp.tools['get_codex_state']
+                self.assertEqual(title, 'Poll Codex State')
+                self.assertTrue(description)
+                self.assertEqual(meta, {'ui': {'visibility': ['app']}})
+                self.assertEqual(server.mcp.resources[app_uri], (
+                    'Codex Monitor UI', 'text/html;profile=mcp-app', {'ui': {'prefersBorder': False}},
+                ))
+
+    def test_v2_result_uses_wire_aliases(self):
+        with patch.dict(sys.modules, self.server_modules(sdk='mcp.server')):
+            server = load('monitor_server', ROOT/'plugin/server.py')
+        opened = server.open_codex_monitor()
+        self.assertTrue(opened.structured_content['changed'])
+        self.assertFalse(opened.is_error)
+        updated = server.get_codex_state()
+        unchanged = server.get_codex_state(updated.structured_content['fingerprint'])
+        self.assertFalse(unchanged.structured_content['changed'])
+        self.assertEqual(unchanged.content[0].text, 'unchanged')
+        with patch.object(self.dashboard, 'build_state', side_effect=OSError):
+            for result in (server.open_codex_monitor(), server.get_codex_state()):
+                self.assertTrue(result.is_error)
+                self.assertEqual(result.structured_content, {'error': result.content[0].text})
 
     def test_compact_and_resource(self):
         server = self.load_server()
@@ -428,6 +497,31 @@ class MonitorTests(unittest.TestCase):
         ), patch.object(installer.Path, 'resolve', return_value=Path(sys.executable)):
             self.assertEqual(installer.discover_python(str(interpreter))['path'], str(interpreter))
 
+    def test_installer_probes_both_sdk_versions(self):
+        installer = load('installer', ROOT/'install.py')
+
+        def run_probe(args):
+            with redirect_stdout(io.StringIO()) as stdout:
+                try:
+                    exec(args[-1], {})
+                except ImportError:
+                    return types.SimpleNamespace(returncode=1, stdout=stdout.getvalue())
+            return types.SimpleNamespace(returncode=0, stdout=stdout.getvalue())
+
+        for sdk, version in (('fastmcp', '1.30.0'), ('mcp.server', '2.3.0'), ('mcp.server.mcpserver', '2.3.0')):
+            modules = self.server_modules(sdk=sdk)
+            with self.subTest(sdk=sdk), patch.dict(sys.modules, modules), patch(
+                'importlib.metadata.version', return_value=version
+            ), patch.object(installer, 'run_checked', side_effect=run_probe):
+                self.assertEqual(installer.discover_python(sys.executable), {
+                    'path': sys.executable, 'mcp_version': version,
+                })
+                with patch.dict(modules['mcp.types'].__dict__):
+                    del modules['mcp.types'].CallToolResult
+                    self.assertIsNone(installer.discover_python(sys.executable))
+                del modules['mcp.types'].TextContent
+                self.assertIsNone(installer.discover_python(sys.executable))
+
     def test_failed_upgrade_restores_existing_install(self):
         installer = load('installer', ROOT/'install.py')
         target = self.path/'installed'
@@ -453,7 +547,7 @@ class MonitorTests(unittest.TestCase):
 
     def test_static_and_shell_syntax(self):
         manifest = json.loads((ROOT/'plugin/plugin.json').read_text(encoding='utf-8'))
-        self.assertEqual(manifest['version'],'1.1.0')
+        self.assertEqual(manifest['version'],'1.1.1')
         ps = (ROOT/'plugin/scripts/run-codex.ps1').read_text(encoding='utf-8')
         sh = (ROOT/'plugin/scripts/run-codex.sh').read_bytes().decode('utf-8')
         self.assertNotIn('\r', sh)

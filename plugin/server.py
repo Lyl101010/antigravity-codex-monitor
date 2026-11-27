@@ -7,8 +7,15 @@ import threading
 import time
 
 import dashboard_server as dashboard_server_loader
-from mcp.server.fastmcp import FastMCP  # noqa: E402
-from mcp.types import CallToolResult, TextContent  # noqa: E402
+from mcp.types import CallToolResult, TextContent
+
+try:
+    from mcp.server import MCPServer as _MCPServer
+except ImportError:
+    try:
+        from mcp.server.mcpserver import MCPServer as _MCPServer
+    except ImportError:
+        from mcp.server.fastmcp import FastMCP as _MCPServer
 
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parent
 APP_HTML_PATH = PLUGIN_ROOT / "ui" / "app.html"
@@ -40,7 +47,7 @@ PANE_META = {
 }
 APP_ONLY_META = {"ui": {"visibility": ["app"]}}
 
-mcp = FastMCP("antigravity-codex-monitor")
+mcp = _MCPServer("antigravity-codex-monitor")
 
 
 def _fingerprint(limit, session_id, dispatch_id):

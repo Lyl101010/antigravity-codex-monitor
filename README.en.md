@@ -2,7 +2,7 @@
 
 [简体中文](./README.md) · **English**
 
-[![Version](https://img.shields.io/badge/version-1.1.0-3D6470.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
+[![Version](https://img.shields.io/badge/version-1.1.1-3D6470.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Antigravity](https://img.shields.io/badge/Antigravity-2.x%20MCP%20App-C96442.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-4B5563.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -42,7 +42,7 @@ When Antigravity (Gemini) delegates scoped coding, refactoring, scripting, or un
 ### Prerequisites
 - **Google Antigravity 2.x**
 - **OpenAI Codex CLI** (official CLI, signed in via `codex login`)
-- **Python 3.10+** with the `mcp` package (`pip install mcp`)
+- **Python 3.10+** with `mcp` 1.x or 2.x (`pip install mcp`)
 
 ### Option 1: One-Prompt Agent Install (Recommended)
 
