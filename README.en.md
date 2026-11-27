@@ -17,6 +17,8 @@ When Antigravity (Gemini) delegates scoped coding, refactoring, scripting, or un
 
 ## Previews
 
+![Antigravity Codex Monitor live demo](assets/demo.gif)
+
 ![Light theme preview](assets/preview-light.png)
 ![Dark theme preview](assets/preview-dark.png)
 

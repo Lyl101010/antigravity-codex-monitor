@@ -18,6 +18,10 @@
 
 ## 实机预览
 
+### 15 秒实机动态演示
+
+![Antigravity Codex Monitor 实机动态演示](assets/demo.gif)
+
 ### 浅色暖纸模式（左侧会话列表 + 实时对话流 / 命令输出 / 语法高亮 Diff）
 ![Antigravity Codex Monitor 浅色模式预览](assets/preview-light.png)
 
