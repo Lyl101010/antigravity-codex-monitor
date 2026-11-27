@@ -7,6 +7,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-4B5563.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Zero Patch](https://img.shields.io/badge/Zero%20CDP%20%2F%20No%20ASAR-2E7D5B.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Antigravity Codex Monitor MCP server](https://glama.ai/mcp/servers/Lyl101010/antigravity-codex-monitor/badges/score.svg)](https://glama.ai/mcp/servers/Lyl101010/antigravity-codex-monitor)
 
 面向 **Google Antigravity** 的原生 **MCP Server / MCP App**（Model Context Protocol）实时协作监控面板与 `codex-worker` 派单套件。
 

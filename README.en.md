@@ -6,6 +6,7 @@
 [![Antigravity](https://img.shields.io/badge/Antigravity-2.x%20MCP%20App-C96442.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-4B5563.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Antigravity Codex Monitor MCP server](https://glama.ai/mcp/servers/Lyl101010/antigravity-codex-monitor/badges/score.svg)](https://glama.ai/mcp/servers/Lyl101010/antigravity-codex-monitor)
 
 A native **MCP App** side-pane Mission Control UI and cross-platform `codex-worker` delegation bundle for **Google Antigravity**.
 
