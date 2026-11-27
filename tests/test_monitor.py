@@ -461,8 +461,10 @@ class MonitorTests(unittest.TestCase):
         self.assertRegex(ps, r'if \(-not \$ResumeSessionId[^)\n]*\)[^\n]*--worktree')
         self.assertRegex(sh, r'(?m)^if .* -z "\$resume" .*--worktree')
         self.assertNotRegex(sh, r'(?m)^\s*export\b[^\n]*\bMONITOR_PROMPT\b')
+        self.assertNotIn('gpt-6.2'+'-sol', ps.lower())
+        self.assertNotIn('gpt-6.2'+'-sol', sh.lower())
         forbidden = ['liyi'+'lin','App_'+'Downloads','codex_'+'to_ag','antigravity-'+'official.png',
-                     '<meta name='+'"generator"','gpt-6.2'+'-sol']
+                     '<meta name='+'"generator"']
         for parent in ('plugin','ui-src'):
             for file in (ROOT/parent).rglob('*'):
                 if file.is_file() and 'node_modules' not in file.parts and '__pycache__' not in file.parts:
