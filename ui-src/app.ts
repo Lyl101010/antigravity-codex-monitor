@@ -35,6 +35,8 @@ type Session = {
   direction?: 'ag_to_codex';
   cwd: string;
   project: string;
+  project_key?: string;
+  project_root?: string;
   model: string;
   dispatcher_model?: string;
   effort: string;
@@ -408,14 +410,14 @@ function render(focusedTurn?: Turn): void {
   }
 
   // Group sessions by project directory (most recently active project first)
-  type ProjectGroup = { key: string; name: string; cwd: string; hasRunning: boolean; sessions: Session[] };
+  type ProjectGroup = { key: string; name: string; root: string; hasRunning: boolean; sessions: Session[] };
   const groups: ProjectGroup[] = [];
   const groupMap = new Map<string, ProjectGroup>();
   for (const s of list) {
-    const gKey = (s.cwd || s.project || 'unknown').toLowerCase();
+    const gKey = s.project_key || s.cwd || s.project || 'unknown';
     let g = groupMap.get(gKey);
     if (!g) {
-      g = { key: gKey, name: s.project || '未命名项目', cwd: s.cwd || '', hasRunning: false, sessions: [] };
+      g = { key: gKey, name: s.project || '未命名项目', root: s.project_root || s.cwd, hasRunning: false, sessions: [] };
       groupMap.set(gKey, g);
       groups.push(g);
     }
@@ -430,7 +432,7 @@ function render(focusedTurn?: Turn): void {
       ? groups
           .map(
             (g) =>
-              `<optgroup label="${esc(g.name)} (${g.sessions.length})">${g.sessions
+              `<optgroup label="${esc(g.name)} (${g.sessions.length})" title="${esc(g.root)}">${g.sessions
                 .map((s) => {
                   const mark = s.status === 'running' ? '● ' : '';
                   const firstLine = ((s.turns[0]?.prompt || '').split('\n')[0] || 'Codex 会话').slice(0, 32);
@@ -470,7 +472,7 @@ function render(focusedTurn?: Turn): void {
 
             return `
               <details class="proj-group" data-key="${esc(dKey)}" ${isOpen ? 'open' : ''}>
-                <summary class="proj-head" title="${esc(g.cwd)}">
+                <summary class="proj-head" title="${esc(g.root)}">
                   <svg class="proj-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4l4 4-4 4"/></svg>
                   <svg class="proj-folder" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><path d="M1.8 4.2a1.2 1.2 0 0 1 1.2-1.2h3.1l1.3 1.4H13a1.2 1.2 0 0 1 1.2 1.2v6.2A1.2 1.2 0 0 1 13 13H3a1.2 1.2 0 0 1-1.2-1.2V4.2z"/></svg>
                   <span class="proj-name">${esc(g.name)}</span>
@@ -929,7 +931,7 @@ async function boot(): Promise<void> {
       session_id: 'demo-1',
       cwd: '/workspace/auth-service',
       project: 'auth-service',
-      model: 'gpt-6.2-sol',
+      model: 'config default',
       dispatcher_model: 'gemini-4-neon-high',
       effort: 'high',
       updated_fmt: '2026-11-26 10:15:00',
@@ -943,7 +945,7 @@ async function boot(): Promise<void> {
         ended_fmt: '2026-11-26 10:15:00',
         duration_s: 38,
         status: 'completed',
-        model: 'gpt-6.2-sol',
+        model: 'config default',
         dispatcher_model: 'gemini-4-neon-high',
         effort: 'high',
         cwd: '/workspace/auth-service',
@@ -978,7 +980,7 @@ async function boot(): Promise<void> {
       session_id: 'demo-2',
       cwd: '/workspace/cache-parser',
       project: 'cache-parser',
-      model: 'gpt-6.2-sol',
+      model: 'config default',
       dispatcher_model: 'gemini-4-neon-high',
       effort: 'medium',
       updated_fmt: '2026-11-26 09:42:10',
@@ -992,7 +994,7 @@ async function boot(): Promise<void> {
         ended_fmt: '2026-11-26 09:42:10',
         duration_s: 24,
         status: 'completed',
-        model: 'gpt-6.2-sol',
+        model: 'config default',
         dispatcher_model: 'gemini-4-neon-high',
         effort: 'medium',
         cwd: '/workspace/cache-parser',

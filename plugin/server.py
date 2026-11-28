@@ -129,7 +129,7 @@ def _fit_state(state, max_bytes, session_id="", dispatch_id=""):
         for key in ("prompt", "final_message", "cwd", "model", "effort", "dispatcher_model", "started_fmt", "ended_fmt"):
             if key in target_turn:
                 target_turn[key] = ""
-    for key in ("cwd", "project", "model", "effort", "updated_fmt", "dispatcher_model"):
+    for key in ("cwd", "project", "project_key", "project_root", "model", "effort", "updated_fmt", "dispatcher_model"):
         if key in session:
             session[key] = ""
     if _payload_size(state) <= max_bytes:

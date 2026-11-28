@@ -74,11 +74,11 @@ class MonitorTests(unittest.TestCase):
         (self.path/'codex-worker-dispatches.json').write_text(json.dumps([{'direction':'other','status':'running'}]))
         self.assertEqual(self.dashboard.build_state()['sessions'],[])
 
-    def write_rollout(self, session_id, *events):
+    def write_rollout(self, session_id, *events, cwd='/workspace/demo'):
         folder = self.path/'sessions'/datetime.now().strftime('%Y/%m/%d')
         folder.mkdir(parents=True, exist_ok=True)
         transcript = folder/f'rollout-{session_id}.jsonl'
-        header = ('2026-11-26T10:00:00Z', 'session_meta', {'id':session_id, 'source':'exec', 'cwd':'/workspace/demo'})
+        header = ('2026-11-26T10:00:00Z', 'session_meta', {'id':session_id, 'source':'exec', 'cwd':str(cwd)})
         transcript.write_text('\n'.join(
             json.dumps(dict(timestamp=stamp, type=kind, payload=payload))
             for stamp, kind, payload in (header, *events)
@@ -164,6 +164,130 @@ class MonitorTests(unittest.TestCase):
         self.assertNotIn('a', sessions)
         self.assertEqual(sessions['new']['dispatch_ids'], ['a'])
         self.assertEqual(sessions['b']['dispatch_ids'], ['b'])
+
+    def linked_worktree(self):
+        repo = self.path/'repo'
+        gitdir = repo/'.git/worktrees/linked'
+        gitdir.mkdir(parents=True)
+        worktree = self.path/'worktrees/task/linked'
+        worktree.mkdir(parents=True)
+        relative_gitdir = Path(os.path.relpath(gitdir, worktree)).as_posix()
+        (worktree/'.git').write_text(f'gitdir: {relative_gitdir}\n', encoding='utf-8')
+        (gitdir/'commondir').write_text('../..\n', encoding='utf-8')
+        return repo, worktree
+
+    def write_project_rollout(self, session_id, cwd, stamp):
+        message = {'type':'item_completed', 'turn_id':'t1',
+                   'item':{'type':'UserMessage', 'content':[{'text':'Inspect cache'}]}}
+        return self.write_rollout(session_id, (stamp, 'turn_context', {'turn_id':'t1', 'cwd':str(cwd)}),
+                                  (stamp, 'event_msg', message), cwd=cwd)
+
+    def test_linked_worktree_reconciles_pending_dispatch(self):
+        repo, worktree = self.linked_worktree()
+        cwd = worktree/'src'
+        cwd.mkdir()
+        stamp = '2026-11-26T10:00:00Z'
+        self.write_project_rollout('linked', cwd, stamp)
+        self.dashboard.DISPATCH_LOG.write_text(json.dumps([
+            {'dispatch_id':'job', 'session_id':'', 'status':'running', 'target_root':str(repo),
+             'started_at':stamp, 'prompt_preview':'Inspect cache'}
+        ]), encoding='utf-8')
+
+        session, = self.dashboard.build_state()['sessions']
+        self.assertEqual((session['session_id'], session['dispatch_ids']), ('linked', ['job']))
+        self.assertEqual(session['turns'][0]['dispatch_id'], 'job')
+        self.assertEqual(session['cwd'], str(cwd))
+        identity = (self.dashboard.path_key(repo.resolve()), str(repo.resolve()), 'repo', True)
+        self.assertEqual((session['project_key'], session['project_root'], session['project']), identity[:3])
+        (repo/'.git/worktrees/linked/commondir').unlink()
+        self.assertEqual(self.dashboard._resolve_repo_identity(cwd), identity)
+
+    def test_same_basename_repos_do_not_cross_match_pending_dispatch(self):
+        first, second = self.path/'a/repo', self.path/'b/repo'
+        for repo in (first, second):
+            (repo/'.git').mkdir(parents=True)
+        stamp = '2026-11-26T10:00:00Z'
+        self.write_project_rollout('second', second, stamp)
+        self.dashboard.DISPATCH_LOG.write_text(json.dumps([
+            {'dispatch_id':'job', 'session_id':'', 'status':'running', 'target_root':str(first),
+             'started_at':stamp, 'prompt_preview':'Inspect cache'}
+        ]), encoding='utf-8')
+
+        sessions = {s['session_id']:s for s in self.dashboard.build_state()['sessions']}
+        self.assertEqual(set(sessions), {'job', 'second'})
+        for sid, repo in (('job', first), ('second', second)):
+            self.assertEqual(sessions[sid]['project'], 'repo')
+            self.assertEqual(sessions[sid]['project_root'], str(repo.resolve()))
+            self.assertEqual(sessions[sid]['project_key'], self.dashboard.path_key(repo.resolve()))
+        self.assertNotEqual(sessions['job']['project_key'], sessions['second']['project_key'])
+        self.assertEqual(sessions['second']['dispatch_ids'], [])
+        self.assertEqual(sessions['job']['dispatch_ids'], ['job'])
+
+    def test_concurrent_pending_dispatches_do_not_claim_linked_worktree(self):
+        repo, worktree = self.linked_worktree()
+        stamp = '2026-11-26T10:00:00Z'
+        self.write_project_rollout('linked', worktree, stamp)
+        entries = [
+            {'dispatch_id':name, 'session_id':'', 'status':'running', 'target_root':str(repo),
+             'started_at':stamp, 'prompt_preview':'Inspect cache'}
+            for name in ('a', 'b')
+        ]
+        self.dashboard.DISPATCH_LOG.write_text(json.dumps(entries), encoding='utf-8')
+        sessions = {s['session_id']:s for s in self.dashboard.build_state()['sessions']}
+        self.assertEqual(set(sessions), {'a', 'b', 'linked'})
+        self.assertEqual(sessions['linked']['dispatch_ids'], [])
+
+        entries[0]['session_id'] = 'linked'
+        self.dashboard.DISPATCH_LOG.write_text(json.dumps(entries), encoding='utf-8')
+        sessions = {s['session_id']:s for s in self.dashboard.build_state()['sessions']}
+        self.assertEqual(set(sessions), {'b', 'linked'})
+        self.assertEqual(sessions['linked']['dispatch_ids'], ['a'])
+        self.assertEqual(sessions['b']['dispatch_ids'], ['b'])
+
+    def test_dispatch_session_id_published_mid_scan_binds_immediately(self):
+        d = self.dashboard
+        stamp = '2026-11-26T10:00:00Z'
+        older = self.write_project_rollout('linked', '/workspace/demo', stamp)
+        newer = self.write_project_rollout('recent', '/workspace/demo', stamp)
+        os.utime(older, (1, 1))
+        os.utime(newer, (2, 2))
+        queued = {'dispatch_id':'job', 'session_id':'', 'status':'running', 'started_at':stamp,
+                  'target_root':'/workspace/demo', 'prompt_preview':'Different preview', 'dispatcher_model':'dispatcher'}
+        parse_rollout = d.parse_rollout
+
+        def parse_and_publish(path):
+            turns = parse_rollout(path)
+            if Path(path) == newer:
+                entries = [dict(queued, session_id='linked')]
+                d.DISPATCH_LOG.write_text(json.dumps(entries), encoding='utf-8')
+            return turns
+
+        for kwargs in ({}, {'limit':1, 'include_dispatch_id':'job'}):
+            with self.subTest(kwargs=kwargs):
+                d.DISPATCH_LOG.write_text(json.dumps([queued]), encoding='utf-8')
+                with patch.object(d, 'parse_rollout', side_effect=parse_and_publish):
+                    sessions = {s['session_id']:s for s in d.build_state(**kwargs)['sessions']}
+                self.assertNotIn('job', sessions)
+                turn, = sessions['linked']['turns']
+                self.assertEqual((turn['turn_id'], turn['dispatch_id'], turn['dispatcher_model']),
+                                 ('t1', 'job', 'dispatcher'))
+
+    def test_pruned_worktree_inherits_exact_dispatch_project(self):
+        repo, worktree = self.linked_worktree()
+        stamp = '2026-11-26T10:00:00Z'
+        self.write_project_rollout('linked', worktree, stamp)
+        shutil.rmtree(worktree)
+        self.dashboard.DISPATCH_LOG.write_text(json.dumps([
+            {'dispatch_id':'job', 'session_id':'linked', 'status':'completed',
+             'target_root':str(repo), 'started_at':stamp}
+        ]), encoding='utf-8')
+
+        session, = self.dashboard.build_state()['sessions']
+        self.assertEqual((session['session_id'], session['dispatch_ids']), ('linked', ['job']))
+        self.assertEqual(session['cwd'], str(worktree))
+        self.assertEqual(session['project'], 'repo')
+        self.assertEqual(session['project_root'], str(repo.resolve()))
+        self.assertEqual(session['project_key'], self.dashboard.path_key(repo.resolve()))
 
     def test_failed_dispatches_update_the_matching_turn(self):
         first, second = '2026-11-26T10:00:00Z', '2026-11-26T10:01:00Z'
@@ -405,6 +529,9 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual((session['session_id'], turn['turn_id'], turn['dispatch_id']), ('target', 't1', 'first'))
         self.assertEqual(set(session), set(full['sessions'][0]))
         self.assertEqual(set(turn), set(full['sessions'][0]['turns'][0]))
+        for key in ('project_key', 'project_root'):
+            self.assertTrue(full['sessions'][0][key])
+            self.assertEqual(session[key], '')
 
     def test_server_fingerprint_and_recovery(self):
         server = self.load_server()
@@ -547,7 +674,7 @@ class MonitorTests(unittest.TestCase):
 
     def test_static_and_shell_syntax(self):
         manifest = json.loads((ROOT/'plugin/plugin.json').read_text(encoding='utf-8'))
-        self.assertEqual(manifest['version'],'1.1.1')
+        self.assertEqual(manifest['version'],'1.1.2')
         ps = (ROOT/'plugin/scripts/run-codex.ps1').read_text(encoding='utf-8')
         sh = (ROOT/'plugin/scripts/run-codex.sh').read_bytes().decode('utf-8')
         self.assertNotIn('\r', sh)
@@ -556,9 +683,7 @@ class MonitorTests(unittest.TestCase):
         self.assertRegex(ps, r'if \(-not \$ResumeSessionId[^)\n]*\)[^\n]*--worktree')
         self.assertRegex(sh, r'(?m)^if .* -z "\$resume" .*--worktree')
         self.assertNotRegex(sh, r'(?m)^\s*export\b[^\n]*\bMONITOR_PROMPT\b')
-        self.assertNotIn('gpt-6.2'+'-sol', ps.lower())
-        self.assertNotIn('gpt-6.2'+'-sol', sh.lower())
-        forbidden = ['liyi'+'lin','App_'+'Downloads','codex_'+'to_ag','antigravity-'+'official.png',
+        forbidden = ['liyi'+'lin','App_'+'Downloads','codex_'+'to_ag','gpt-6.2'+'-sol','antigravity-'+'official.png',
                      '<meta name='+'"generator"']
         for parent in ('plugin','ui-src'):
             for file in (ROOT/parent).rglob('*'):
@@ -834,6 +959,69 @@ for (const [status, label, events] of [
   assert.ok(feed.innerHTML.includes(label));
   assert.doesNotMatch(feed.innerHTML, /正在执行|已完成执行/);
 }
+'''
+        subprocess.run([shutil.which('node'), '-e', script], cwd=ROOT/'ui-src', check=True, timeout=10)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is unavailable')
+    def test_ui_groups_worktrees_by_project_key(self):
+        script = r'''
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const { transformSync } = require('esbuild');
+const source = fs.readFileSync('app.ts', 'utf8');
+const { code } = transformSync(source.replace(/^import \{[\s\S]*?\} from '[^']+';/, '').replace('void boot();', ''), { loader: 'ts' });
+
+const sidebar = {
+  querySelectorAll() {
+    this.buttons = Array.from(this.innerHTML.matchAll(/data-sid="([^"]+)"/g),
+      ([, sid]) => ({ dataset: { sid } }));
+    return this.buttons;
+  },
+};
+const selector = {}, feed = {}, meta = {};
+const nodes = { 'side-list': sidebar, 'sess-select': selector, 'chat-feed': feed, 'thread-meta': meta };
+const window = {};
+window.parent = window;
+function session(session_id, project_key, cwd) {
+  return { session_id, project_key, project_root: project_key, cwd, project: project_key.split('/').at(-1),
+    model: 'default', status: 'completed', turns: [{
+      turn_id: 't1', status: 'completed', prompt: session_id, events: [],
+      files: [{ path: cwd + '/file.txt', kind: 'add' }],
+    }] };
+}
+window.__INITIAL_STATE__ = { sessions: [
+  session('linked', '/src/Repo', '/worktrees/linked'),
+  session('main', '/src/Repo', '/src/Repo'),
+] };
+const context = vm.createContext({
+  window, document: { getElementById: (id) => nodes[id], querySelectorAll: () => [] },
+});
+vm.runInContext(code + '\nwireControls(); render();', context);
+const groups = () => Array.from(sidebar.innerHTML.matchAll(/<details class="proj-group"[\s\S]*?<\/details>/g), ([html]) => html);
+const optgroups = () => Array.from(selector.innerHTML.matchAll(/<optgroup\b[\s\S]*?<\/optgroup>/g), ([html]) => html);
+assert.equal(groups().length, 1);
+assert.equal(optgroups().length, 1);
+assert.match(groups()[0], /class="proj-head" title="\/src\/Repo"/);
+assert.match(optgroups()[0], /<optgroup label="Repo \(2\)" title="\/src\/Repo"/);
+assert.deepEqual(sidebar.buttons.map((button) => button.dataset.sid), ['linked', 'main']);
+for (const sid of ['linked', 'main']) {
+  assert.ok(optgroups()[0].includes('value="' + sid + '"'));
+  sidebar.buttons.find((button) => button.dataset.sid === sid).onclick();
+  assert.equal(vm.runInContext('selectedSid', context), sid);
+}
+selector.value = 'linked';
+selector.onchange();
+assert.equal(vm.runInContext('selectedSid', context), 'linked');
+assert.match(meta.innerHTML, /title="\/worktrees\/linked"/);
+assert.match(feed.innerHTML, /<span>file\.txt<\/span>/);
+
+window.__INITIAL_STATE__.sessions.push(session('separate', '/src/repo', '/src/repo'));
+vm.runInContext('render()', context);
+assert.equal(groups().length, 2);
+assert.match(groups()[1], /data-key="proj:\/src\/repo"/);
+assert.equal(optgroups().length, 2);
+assert.match(optgroups()[1], /<optgroup label="repo \(1\)" title="\/src\/repo"/);
 '''
         subprocess.run([shutil.which('node'), '-e', script], cwd=ROOT/'ui-src', check=True, timeout=10)
 

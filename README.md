@@ -2,7 +2,7 @@
 
 **简体中文** · [English](./README.en.md)
 
-[![Version](https://img.shields.io/badge/version-1.1.1-3D6470.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
+[![Version](https://img.shields.io/badge/version-1.1.2-3D6470.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Antigravity](https://img.shields.io/badge/Antigravity-2.x%20MCP%20App-C96442.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-4B5563.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)
 [![Zero Patch](https://img.shields.io/badge/Zero%20CDP%20%2F%20No%20ASAR-2E7D5B.svg)](https://github.com/Lyl101010/antigravity-codex-monitor)

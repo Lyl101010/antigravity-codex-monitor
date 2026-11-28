@@ -8,6 +8,7 @@ import threading
 import time
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from functools import cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -34,6 +35,46 @@ def clean_path(p):
 def path_key(p):
     value = os.path.normpath(clean_path(p)) if p else ""
     return value.lower() if os.name == "nt" else value
+
+
+def _resolve_repo_identity(cwd_str):
+    cwd = clean_path(cwd_str)
+    if not cwd:
+        return "", "", "unknown", False
+
+    directory = pathlib.Path(cwd)
+    try:
+        if directory.is_dir():
+            directory = directory.resolve(strict=True)
+            for root in (directory, *directory.parents[:31]):
+                marker = root / ".git"
+                if marker.is_dir():
+                    return path_key(root), clean_path(root), root.name or "unknown", True
+                if not marker.is_file():
+                    continue
+                with marker.open(encoding="utf-8", errors="surrogateescape") as gitfile:
+                    line = gitfile.readline()
+                gitdir_path = line.removeprefix("gitdir:").strip()
+                if not line.startswith("gitdir:") or not gitdir_path:
+                    break
+
+                gitdir = (root / gitdir_path).resolve(strict=True)
+                if not gitdir.is_dir():
+                    break
+                commondir = gitdir / "commondir"
+                if commondir.is_file():
+                    common_path = commondir.read_text(encoding="utf-8", errors="surrogateescape").strip()
+                    common_gitdir = (gitdir / common_path).resolve(strict=True)
+                    if path_key(common_gitdir.name) == ".git" and common_gitdir.is_dir():
+                        root = common_gitdir.parent
+                elif (path_key(gitdir.parent.name) == "worktrees"
+                      and path_key(gitdir.parent.parent.name) == ".git"):
+                    root = gitdir.parent.parent.parent
+                return path_key(root), clean_path(root), root.name or "unknown", True
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+    return path_key(cwd), cwd, pathlib.Path(cwd).name or "unknown", False
 
 
 def parse_dt(value):
@@ -170,9 +211,19 @@ def load_dispatches():
         return []
     try:
         data = json.loads(DISPATCH_LOG.read_text(encoding="utf-8-sig"))
-        return data if isinstance(data, list) else []
+        if isinstance(data, list):
+            return [d for d in data if isinstance(d, dict) and d.get("direction", "ag_to_codex") == "ag_to_codex"]
     except Exception:
-        return []
+        pass
+    return []
+
+
+def _dispatch_log_stat():
+    try:
+        st = DISPATCH_LOG.stat()
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
 
 
 def format_cmd(item):
@@ -377,7 +428,8 @@ def dispatch_session_ids(dispatches, session_id, dispatch_id):
 
 
 def build_state(limit=25, include_session_id="", include_dispatch_id=""):
-    dispatches = [d for d in load_dispatches() if isinstance(d, dict) and d.get("direction", "ag_to_codex") == "ag_to_codex"]
+    dispatch_stat = _dispatch_log_stat()
+    dispatches = load_dispatches()
     target_sids = dispatch_session_ids(dispatches, include_session_id, include_dispatch_id)
     threads = collect_exec_threads(limit=limit + 1, include_session_ids=target_sids)
     can_match_pending = len(threads) <= limit
@@ -385,34 +437,53 @@ def build_state(limit=25, include_session_id="", include_dispatch_id=""):
 
     sessions = []
     by_sid = {}
-    for th in threads:
-        turns = parse_rollout(th["rollout_path"])
-        if not turns:
-            continue
-        for tr in turns:
-            tr["dispatcher_model"] = ""
+    repo_identity = cache(_resolve_repo_identity)
 
-        model = th["model"] or next((t["model"] for t in reversed(turns) if t["model"]), "unknown")
-        effort = th["effort"] or next((t["effort"] for t in reversed(turns) if t["effort"]), "")
-        item = {
-            "session_id": th["session_id"],
-            "dispatch_ids": [],
-            "direction": "ag_to_codex",
-            "cwd": th["cwd"],
-            "project": pathlib.Path(th["cwd"]).name if th["cwd"] else "unknown",
-            "model": model,
-            "effort": effort,
-            "updated_fmt": fmt_ts(th["updated_at"]),
-            "updated_ms": to_epoch_ms(th["updated_at"]),
-            "tokens_used": th["tokens_used"],
-            "status": turns[-1]["status"],
-            "turns": turns,
-        }
-        sessions.append(item)
-        by_sid[th["session_id"]] = item
+    def add_rollout_sessions(rollout_threads):
+        for th in rollout_threads:
+            turns = parse_rollout(th["rollout_path"])
+            if not turns:
+                continue
+            for tr in turns:
+                tr["dispatcher_model"] = ""
+
+            model = th["model"] or next((t["model"] for t in reversed(turns) if t["model"]), "unknown")
+            effort = th["effort"] or next((t["effort"] for t in reversed(turns) if t["effort"]), "")
+            project_key, project_root, project, _ = repo_identity(th["cwd"])
+            item = {
+                "session_id": th["session_id"],
+                "dispatch_ids": [],
+                "direction": "ag_to_codex",
+                "cwd": th["cwd"],
+                "project": project,
+                "project_key": project_key,
+                "project_root": project_root,
+                "model": model,
+                "effort": effort,
+                "updated_fmt": fmt_ts(th["updated_at"]),
+                "updated_ms": to_epoch_ms(th["updated_at"]),
+                "tokens_used": th["tokens_used"],
+                "status": turns[-1]["status"],
+                "turns": turns,
+            }
+            sessions.append(item)
+            by_sid[th["session_id"]] = item
+
+    add_rollout_sessions(threads)
+    if _dispatch_log_stat() != dispatch_stat:
+        previous_sids = {d.get("session_id") for d in dispatches}
+        dispatches = load_dispatches()
+        published_sids = {d["session_id"] for d in dispatches if d.get("session_id")} - previous_sids
+        target_sids = dispatch_session_ids(dispatches, include_session_id, include_dispatch_id)
+        missing_sids = (target_sids | published_sids) - by_sid.keys()
+        if missing_sids:
+            added_threads = collect_exec_threads(limit=0, include_session_ids=missing_sids)
+            can_match_pending = can_match_pending and len({th["session_id"] for th in threads + added_threads}) <= limit
+            add_rollout_sessions(added_threads)
 
     matched_turns = set()
     pending = []
+    restored_projects = set()
 
     def attach(session, turn, dispatch, status):
         dispatch_id = dispatch.get("dispatch_id") or ""
@@ -435,6 +506,15 @@ def build_state(limit=25, include_session_id="", include_dispatch_id=""):
         d_ms = to_epoch_ms(d.get("started_at")) or 0
         session = by_sid.get(sid)
         if session:
+            cwd = session["cwd"]
+            root = clean_path(d.get("target_root"))
+            if root and sid not in restored_projects and (not cwd or not pathlib.Path(cwd).exists()):
+                key, project_root, project, is_git_repo = repo_identity(root)
+                under_worktrees = pathlib.Path(path_key(cwd)).is_relative_to(path_key(CODEX_HOME / "worktrees"))
+                same_name = path_key(pathlib.Path(cwd).name) == path_key(pathlib.Path(root).name)
+                if is_git_repo or not cwd or (key != session["project_key"] and (under_worktrees or same_name)):
+                    session.update(project_key=key, project_root=project_root, project=project)
+                    restored_projects.add(sid)
             rollout_turns = session["turns"]
             if d_ms:
                 candidates = [
@@ -454,19 +534,20 @@ def build_state(limit=25, include_session_id="", include_dispatch_id=""):
         if status in ("running", "failed"):
             pending.append((d, status, sid, d_ms))
 
-    # Before thread.started, require a unique new rollout with the dispatch's prompt and cwd.
+    # Before thread.started, require a unique new rollout with the dispatch's prompt and project.
     known_sids = {d.get("session_id") for d in dispatches if d.get("session_id")}
     pending_matches = {}
     match_counts = {}
     for index, (d, status, sid, d_ms) in enumerate(pending):
-        root = path_key(d.get("target_root"))
+        root = clean_path(d.get("target_root"))
         preview = strip_discipline_footer(d.get("prompt_preview") or "")
         if not can_match_pending or sid or status != "running" or not (d_ms and root and preview):
             continue
+        target_key = repo_identity(root)[0]
         candidates = []
         for session in sessions:
             turn = session["turns"][0]
-            if (session["session_id"] not in known_sids and path_key(session["cwd"]) == root
+            if (session["session_id"] not in known_sids and session["project_key"] == target_key
                     and 0 <= (turn["started_ms"] or 0) - d_ms < 120_000
                     and (turn["prompt"] == preview or (len(preview) == 4000 and turn["prompt"].startswith(preview)))):
                 candidates.append(session)
@@ -509,12 +590,15 @@ def build_state(limit=25, include_session_id="", include_dispatch_id=""):
             if turns[-1] is turn and not (session["status"] == "aborted" and status == "running"):
                 session.update(status=status, updated_fmt=turn["started_fmt"], updated_ms=d_ms)
             continue
+        project_key, project_root, project, _ = repo_identity(cwd)
         session = {
             "session_id": sid or d.get("dispatch_id") or "pending",
             "dispatch_ids": [d["dispatch_id"]] if d.get("dispatch_id") else [],
             "direction": "ag_to_codex",
             "cwd": cwd,
-            "project": pathlib.Path(cwd).name if cwd else "unknown",
+            "project": project,
+            "project_key": project_key,
+            "project_root": project_root,
             "model": turn["model"],
             "effort": turn["effort"],
             "updated_fmt": turn["started_fmt"],
@@ -544,12 +628,10 @@ def build_state(limit=25, include_session_id="", include_dispatch_id=""):
 
 def compute_fingerprint(include_session_id="", include_dispatch_id=""):
     parts = []
-    if DISPATCH_LOG.is_file():
-        try:
-            st = DISPATCH_LOG.stat()
-            parts.append(f"d:{st.st_mtime_ns}:{st.st_size}")
-        except OSError:
-            pass
+    dispatch_stat = _dispatch_log_stat()
+    if dispatch_stat is not None:
+        mtime_ns, size = dispatch_stat
+        parts.append(f"d:{mtime_ns}:{size}")
     if STATE_DB.is_file():
         for path in (STATE_DB, STATE_DB.with_name(STATE_DB.name + "-wal")):
             try:
@@ -558,7 +640,7 @@ def compute_fingerprint(include_session_id="", include_dispatch_id=""):
             except OSError:
                 pass
         if include_session_id or include_dispatch_id:
-            dispatches = (d for d in load_dispatches() if isinstance(d, dict) and d.get("direction", "ag_to_codex") == "ag_to_codex")
+            dispatches = load_dispatches()
             target_sids = dispatch_session_ids(dispatches, include_session_id, include_dispatch_id)
             for thread in collect_exec_threads(limit=0, include_session_ids=target_sids, scan_sessions=False):
                 if not thread["rollout_path"]:
