@@ -36,17 +36,27 @@
 ## 核心特性
 
 - **告别 `codex exec` 黑盒**：派单瞬间自动弹出右侧栏面板，每 0.8s 实时流式呈现 Codex 正在执行的命令、退出码、语法高亮 Diff、推理模型与 Token / 缓存命中率，纯本地状态指纹轮询，**不消耗任何模型额度**。
+- **按任务难度自动匹配思考强度**：内置 `codex-worker` 调度策略，Antigravity（Gemini）会根据任务复杂度为每次派单自动传入单次 `model_reasoning_effort`（`low` / `medium` / `high` / `xhigh`），不改动你的全局 `config.toml`——简单机械活自动用 `low` 省额度提速，多文件重构或疑难排错自动拉高到 `high` / `xhigh`（也可随时在对话里手动指定覆盖），右侧面板实时标出本轮模型与档位。
 - **原生 MCP App，不惧客户端更新**：严格遵循 Antigravity 官方插件与 MCP Apps（SEP-1865）规范，**不修改 `.asar`、不依赖 CDP 注入、不破坏客户端签名**，官方更新后依然稳定可用。
 - **一个插件，开箱即用**：内置侧栏监控面板 + 跨平台派单脚本（Windows `run-codex.ps1` / macOS & Linux `run-codex.sh`）+ 内嵌 `codex-worker` Skill，前端已预编译为单文件 HTML，**最终用户安装无需 Node.js**。
 - **无工作区也能派单**。省略目标路径时，启动器会在 `~/.gemini/antigravity/scratch/codex-tasks/` 下创建独立任务目录。可用 `ANTIGRAVITY_SCRATCH_DIR` 自定义 scratch 根目录。
 - **默认隔离**。只读和写任务的默认沙箱分别为 `read-only` 和 `workspace-write`。可信写任务可显式指定 `-Sandbox full-access` / `--sandbox full-access`。Git 写任务默认使用 `--worktree`，支持按 `SESSION_ID` 续跑，最多两轮，合并与推送须由用户确认。
+- **自动思考强度分档策略**：
+
+| 思考档位 | 适用任务 | 效果 |
+| :--- | :--- | :--- |
+| `low` | 批量重命名、格式化、固定样板 | 最快最省额度 |
+| `medium`（默认） | 日常脚本、单元测试、单模块修 Bug | 速度与一次通过率平衡 |
+| `high` | 多文件重构、疑难排错、训练/评测流水线 | 减少返工轮次 |
+| `xhigh` | 核心算法、安全鉴权、复杂并发/高危逻辑 | 最高推理深度 |
+
 - **为什么用 `codex exec + Monitor` 而不是 `codex mcp-server`？**
 
 | 对比维度 | `antigravity-codex-monitor` (`codex exec`) | `codex mcp-server` |
 | :--- | :--- | :--- |
 | **执行过程可见性** | 右侧栏每 0.8s 实时直播命令、Diff 与 Token | 黑盒阻塞，任务执行期间看不到实时过程 |
 | **长任务稳定性** | 走 Antigravity 后台异步命令，5–10 分钟任务不断连 | 容易触发 MCP 单次 RPC 调用超时 |
-| **隔离与档位控制** | 自动 Git `--worktree` 隔离 + `low/medium/high/xhigh` 档位 | 仅暴露基础调用，无内置 worktree 封装 |
+| **隔离与档位控制** | 自动 Git `--worktree` 隔离 + 按难度自动匹配 `low/medium/high/xhigh` 思考强度 | 仅暴露基础调用，无内置 worktree 封装 |
 
 ---
 

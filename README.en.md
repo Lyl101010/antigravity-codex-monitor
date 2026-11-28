@@ -30,10 +30,18 @@ When Antigravity (Gemini) delegates scoped coding, refactoring, scripting, or un
 ## Highlights
 
 - **Live visibility for `codex exec`**: Streams active commands, exit codes, syntax-colored file diffs, and token/cache metrics every 0.8s at zero model cost.
+- **Difficulty-aware reasoning effort**: The bundled `codex-worker` skill lets Antigravity (Gemini) automatically choose per-task `model_reasoning_effort` (`low` / `medium` / `high` / `xhigh`) without modifying your global `config.toml`—fast and quota-friendly on mechanical edits, deep reasoning on multi-file refactors or hard bugs (with manual override anytime), displayed live in the monitor.
 - **Native MCP App (Zero Patch)**: Uses Antigravity's official plugin & MCP Apps (SEP-1865) API—no `.asar` edits, no CDP injection, no breakage on updates.
 - **Cross-platform & self-contained**: Ships Windows (`run-codex.ps1`), macOS/Linux (`run-codex.sh`), a bundled `codex-worker` skill, and a prebuilt single-file HTML UI (**no Node.js required for end users**).
 - **Dispatch from any chat**. Omit the target path to create a fresh task directory under `~/.gemini/antigravity/scratch/codex-tasks/`. Set `ANTIGRAVITY_SCRATCH_DIR` to override the scratch root.
 - **Safe defaults**. Read-only and write tasks default to `read-only` and `workspace-write`, respectively. Trusted write tasks can opt into `-Sandbox full-access` / `--sandbox full-access`. Git write tasks default to `--worktree` isolation. Delegation has a two-round cap and requires user confirmation before merges or pushes.
+
+| Effort Tier | Typical Tasks | Goal |
+| :--- | :--- | :--- |
+| `low` | Batch renames, formatting, mechanical boilerplate | Fastest & lowest quota cost |
+| `medium` (default) | Daily scripts, unit tests, single-module fixes | Balanced speed & first-pass quality |
+| `high` | Multi-file refactors, tricky debugging, pipelines | Fewer retry rounds |
+| `xhigh` | Core algorithms, security/auth, complex concurrency | Maximum reasoning depth |
 
 ---
 
