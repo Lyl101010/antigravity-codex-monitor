@@ -8,5 +8,10 @@
     "Open the Codex Monitor side pane",
     "Delegate a scoped refactor to Codex and watch it live",
     "Review the latest Codex execution diff and test results"
-  ]
+  ],
+  "license": "MIT",
+  "author": "Lyl101010",
+  "homepage": "https://github.com/Lyl101010/antigravity-codex-monitor",
+  "repository": "https://github.com/Lyl101010/antigravity-codex-monitor",
+  "keywords": ["antigravity", "codex", "mcp", "mcp-app", "codex-cli", "monitoring"]
 }
