@@ -1,0 +1,27 @@
+name: HOL Scanner
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan AI Plugin Repository
+        uses: hashgraph-online/ai-plugin-scanner-action@v1.2.821
+        with:
+          plugin_dir: "."
+          mode: scan
+          min_score: 70
+          fail_on_severity: high
+          cisco_skill_scan: on
+          install_cisco: true
+          report_to_hol: true

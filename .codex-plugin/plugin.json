@@ -1,0 +1,33 @@
+{
+  "name": "antigravity-codex-monitor",
+  "version": "1.1.2",
+  "description": "Monitor Codex CLI tasks, live commands, syntax-colored diffs, and token telemetry in an Antigravity side pane.",
+  "license": "MIT",
+  "author": "Lyl101010",
+  "repository": "https://github.com/Lyl101010/antigravity-codex-monitor",
+  "homepage": "https://github.com/Lyl101010/antigravity-codex-monitor",
+  "keywords": ["antigravity", "codex", "mcp", "mcp-app", "codex-cli", "monitoring"],
+  "skills": "./plugin/skills",
+  "interface": {
+    "displayName": "Antigravity Codex Monitor",
+    "developerName": "Lyl101010",
+    "category": "Development & Workflow",
+    "shortDescription": "Monitor Codex CLI tasks live in Antigravity.",
+    "longDescription": "The Antigravity side pane shows live Codex CLI commands, exit codes, syntax-colored diffs, and token and cache metrics from local logs. The bundled codex-worker skill delegates scoped coding and testing tasks to the local Codex CLI on Windows, macOS, and Linux.",
+    "capabilities": [
+      "Real-time Codex CLI execution monitoring",
+      "Live command and syntax-colored diff streaming",
+      "Token and cache telemetry",
+      "Cross-platform codex-worker delegation"
+    ],
+    "websiteURL": "https://github.com/Lyl101010/antigravity-codex-monitor",
+    "privacyPolicyURL": "https://github.com/Lyl101010/antigravity-codex-monitor/blob/main/SECURITY.md",
+    "termsOfServiceURL": "https://github.com/Lyl101010/antigravity-codex-monitor/blob/main/LICENSE",
+    "logo": "./plugin/assets/logo.svg",
+    "composerIcon": "./plugin/assets/logo.svg",
+    "screenshots": [
+      "./assets/preview-light.png",
+      "./assets/preview-dark.png"
+    ]
+  }
+}
