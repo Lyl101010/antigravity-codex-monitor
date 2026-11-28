@@ -182,6 +182,114 @@ class MonitorTests(unittest.TestCase):
         return self.write_rollout(session_id, (stamp, 'turn_context', {'turn_id':'t1', 'cwd':str(cwd)}),
                                   (stamp, 'event_msg', message), cwd=cwd)
 
+    def write_exec_thread_db(self, rows):
+        path = self.path/'state_5.sqlite'
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute('CREATE TABLE threads (id PRIMARY KEY, rollout_path, cwd, created_at, '
+                       'updated_at, model, reasoning_effort, tokens_used, source)')
+            db.executemany('INSERT INTO threads VALUES (?, ?, ?, ?, ?, "", "", 0, "exec")', rows)
+        return path
+
+    def test_pending_dispatch_matches_with_more_than_default_limit_of_historical_threads(self):
+        dashboard = self.dashboard
+        cwd = '/workspace/demo'
+        old = '2026-11-26T09:30:00Z'
+        start = '2026-11-26T10:00:00Z'
+        old_s = dashboard.to_epoch_ms(old) // 1000
+        start_s = dashboard.to_epoch_ms(start) // 1000
+        rows = []
+        for index in range(27):
+            sid = f'history-{index}'
+            path = self.write_rollout(sid, (old, 'event_msg', {'type':'task_complete', 'turn_id':'t1'}))
+            os.utime(path, (old_s, old_s))
+            rows.append((sid, str(path), cwd, old_s, old_s))
+        rollout = self.write_project_rollout('active', cwd, start)
+        os.utime(rollout, (start_s, start_s))
+        rows.append(('active', str(rollout), cwd, start_s, start_s))
+        db_path = self.write_exec_thread_db(rows)
+        dashboard.DISPATCH_LOG.write_text(json.dumps([
+            {'dispatch_id':'job', 'status':'running', 'target_root':cwd,
+             'started_at':start, 'prompt_preview':'Inspect cache'}
+        ]), encoding='utf-8')
+
+        with patch.object(dashboard, 'STATE_DB', db_path):
+            sessions = dashboard.build_state()['sessions']
+        self.assertEqual(len(sessions), 25)
+        running, = [session for session in sessions if session['status'] == 'running']
+        self.assertEqual((running['session_id'], running['dispatch_ids']), ('active', ['job']))
+        turn, = running['turns']
+        self.assertEqual((turn['turn_id'], turn['status'], turn['dispatch_id']), ('t1', 'running', 'job'))
+        self.assertNotIn('job', {session['session_id'] for session in sessions})
+
+    def test_pending_dispatch_checks_rollout_truncation_per_dispatch(self):
+        dashboard = self.dashboard
+        start = '2026-11-26T10:00:00Z'
+        visible_start = '2026-11-26T10:00:02Z'
+        later = '2026-11-26T10:00:03Z'
+        cwd, other_cwd = '/workspace/demo', '/workspace/other'
+        history = self.write_rollout('history', (start, 'event_msg', {'type':'task_complete', 'turn_id':'t1'}))
+        rollouts = [
+            (self.write_project_rollout('omitted', cwd, start), start),
+            (history, '2026-11-26T10:00:01Z'),
+            (self.write_project_rollout('visible', cwd, visible_start), visible_start),
+            (self.write_project_rollout('later', other_cwd, later), later),
+        ]
+        for path, stamp in rollouts:
+            updated = dashboard.to_epoch_ms(stamp) / 1000
+            os.utime(path, (updated, updated))
+        dispatch = {'status':'running', 'prompt_preview':'Inspect cache'}
+        entries = [
+            dict(dispatch, dispatch_id='job', target_root=cwd, started_at=start),
+            dict(dispatch, dispatch_id='later-job', target_root=other_cwd, started_at=later),
+        ]
+        dashboard.DISPATCH_LOG.write_text(json.dumps(entries), encoding='utf-8')
+
+        sessions = {s['session_id']:s for s in dashboard.build_state(limit=3)['sessions']}
+        self.assertEqual(set(sessions), {'job', 'visible', 'later'})
+        self.assertEqual(sessions['job']['turns'][0]['turn_id'], 'pending')
+        self.assertEqual(sessions['visible']['dispatch_ids'], [])
+        self.assertEqual(sessions['later']['dispatch_ids'], ['later-job'])
+
+        entries[1].update(target_root=cwd, started_at=visible_start)
+        dashboard.DISPATCH_LOG.write_text(json.dumps(entries), encoding='utf-8')
+        sessions = {s['session_id']:s for s in dashboard.build_state(limit=3)['sessions']}
+        self.assertEqual(sessions['visible']['dispatch_ids'], [])
+        self.assertEqual(sessions['later-job']['turns'][0]['turn_id'], 'pending')
+
+    def test_pending_dispatch_refuses_match_when_sqlite_truncates_same_second(self):
+        dashboard = self.dashboard
+        cwd = '/workspace/demo'
+        start = '2026-11-26T10:00:00.250Z'
+        start_s = dashboard.to_epoch_ms(start) // 1000
+        visible = self.write_project_rollout('visible', cwd, '2026-11-26T10:00:02Z')
+        os.utime(visible, (start_s + 2, start_s + 2))
+        hidden = self.write_project_rollout('hidden', cwd, '2026-11-26T10:00:00.500Z')
+        old_dir = self.path/'sessions/2020/01/01'
+        old_dir.mkdir(parents=True)
+        hidden = hidden.rename(old_dir/hidden.name)
+        os.utime(hidden, (start_s + 0.5, start_s + 0.5))
+        rows = [
+            ('visible', str(visible), cwd, start_s + 2, start_s + 2),
+            ('hidden', str(hidden), cwd, start_s, start_s),
+        ]
+        for index in range(2):
+            sid = f'history-{index}'
+            old = '2026-11-26T09:30:00Z'
+            path = self.write_rollout(sid, (old, 'event_msg', {'type':'task_complete', 'turn_id':'t1'}))
+            os.utime(path, (start_s - 1, start_s - 1))
+            rows.append((sid, str(path), cwd, dashboard.to_epoch_ms(old) // 1000, start_s + 1))
+        db_path = self.write_exec_thread_db(rows)
+        dashboard.DISPATCH_LOG.write_text(json.dumps([
+            {'dispatch_id':'job', 'status':'running', 'target_root':cwd,
+             'started_at':start, 'prompt_preview':'Inspect cache'}
+        ]), encoding='utf-8')
+
+        with patch.object(dashboard, 'STATE_DB', db_path):
+            sessions = {s['session_id']:s for s in dashboard.build_state(limit=2)['sessions']}
+        self.assertEqual(set(sessions), {'job', 'visible'})
+        self.assertEqual(sessions['job']['turns'][0]['turn_id'], 'pending')
+        self.assertEqual(sessions['visible']['dispatch_ids'], [])
+
     def test_linked_worktree_reconciles_pending_dispatch(self):
         repo, worktree = self.linked_worktree()
         cwd = worktree/'src'

@@ -129,8 +129,14 @@ def read_session_header(path):
 
 
 def collect_exec_threads(limit=30, include_session_ids=(), scan_sessions=True):
+    threads, _ = _collect_exec_threads(limit, include_session_ids, scan_sessions)
+    return threads
+
+
+def _collect_exec_threads(limit, include_session_ids, scan_sessions=True, *, db_lookahead=0):
     include_session_ids = set(include_session_ids)
     by_sid = {}
+    latest_omitted_ms = float("-inf")
 
     if STATE_DB.is_file():
         try:
@@ -143,7 +149,12 @@ def collect_exec_threads(limit=30, include_session_ids=(), scan_sessions=True):
                     FROM threads
                     WHERE source = 'exec'
                 """
-                rows = con.execute(query + " ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+                db_limit = limit + db_lookahead
+                rows = con.execute(query + " ORDER BY updated_at DESC LIMIT ?", (db_limit + 1,)).fetchall()
+                if len(rows) > db_limit:
+                    omitted_ms = to_epoch_ms(rows.pop()[4])
+                    # SQLite's updated_at is stored in whole seconds.
+                    latest_omitted_ms = omitted_ms + 999 if omitted_ms is not None else float("inf")
                 if include_session_ids:
                     placeholders = ",".join("?" for _ in include_session_ids)
                     rows += con.execute(query + f" AND id IN ({placeholders})", tuple(include_session_ids)).fetchall()
@@ -203,7 +214,12 @@ def collect_exec_threads(limit=30, include_session_ids=(), scan_sessions=True):
                 }
 
     ordered = sorted(by_sid.values(), key=lambda x: float(x.get("updated_at") or 0), reverse=True)
-    return ordered[:limit] + [th for th in ordered[limit:] if th["session_id"] in include_session_ids]
+    overflow = ordered[limit:]
+    first_omitted = next((th for th in overflow if th["session_id"] not in include_session_ids), None)
+    if first_omitted is not None:
+        omitted_ms = to_epoch_ms(first_omitted["updated_at"])
+        latest_omitted_ms = max(latest_omitted_ms, omitted_ms if omitted_ms is not None else float("inf"))
+    return ordered[:limit] + [th for th in overflow if th["session_id"] in include_session_ids], latest_omitted_ms
 
 
 def load_dispatches():
@@ -431,9 +447,7 @@ def build_state(limit=25, include_session_id="", include_dispatch_id=""):
     dispatch_stat = _dispatch_log_stat()
     dispatches = load_dispatches()
     target_sids = dispatch_session_ids(dispatches, include_session_id, include_dispatch_id)
-    threads = collect_exec_threads(limit=limit + 1, include_session_ids=target_sids)
-    can_match_pending = len(threads) <= limit
-    threads = threads[:limit] + [th for th in threads[limit:] if th["session_id"] in target_sids]
+    threads, latest_omitted_ms = _collect_exec_threads(limit, target_sids, db_lookahead=1)
 
     sessions = []
     by_sid = {}
@@ -478,7 +492,6 @@ def build_state(limit=25, include_session_id="", include_dispatch_id=""):
         missing_sids = (target_sids | published_sids) - by_sid.keys()
         if missing_sids:
             added_threads = collect_exec_threads(limit=0, include_session_ids=missing_sids)
-            can_match_pending = can_match_pending and len({th["session_id"] for th in threads + added_threads}) <= limit
             add_rollout_sessions(added_threads)
 
     matched_turns = set()
@@ -541,7 +554,7 @@ def build_state(limit=25, include_session_id="", include_dispatch_id=""):
     for index, (d, status, sid, d_ms) in enumerate(pending):
         root = clean_path(d.get("target_root"))
         preview = strip_discipline_footer(d.get("prompt_preview") or "")
-        if not can_match_pending or sid or status != "running" or not (d_ms and root and preview):
+        if sid or status != "running" or not (d_ms and root and preview):
             continue
         target_key = repo_identity(root)[0]
         candidates = []
@@ -553,7 +566,7 @@ def build_state(limit=25, include_session_id="", include_dispatch_id=""):
                 candidates.append(session)
                 candidate_sid = session["session_id"]
                 match_counts[candidate_sid] = match_counts.get(candidate_sid, 0) + 1
-        if len(candidates) == 1:
+        if len(candidates) == 1 and latest_omitted_ms < d_ms:
             pending_matches[index] = candidates[0]
 
     for index, (d, status, sid, d_ms) in enumerate(pending):
